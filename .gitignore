@@ -43,8 +43,7 @@ run.out
 run.err
 
 # ===== 编辑器 / 系统 =====
-.vscode/*
-!.vscode/extensions.json
+.vscode/
 .idea/
 .DS_Store
 Thumbs.db
