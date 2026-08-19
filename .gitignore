@@ -1,0 +1,54 @@
+# ============================================================
+# PrivChat 根 .gitignore
+# 覆盖：构建产物、运行时数据、密钥与编辑器杂项。
+# ============================================================
+
+# ===== 构建产物 =====
+/target/
+node_modules/
+dist/
+dist-ssr/
+*.idsig
+
+# 本地 APK 构建产物（大文件，不入库）
+/apk/
+*.apk
+
+# Tauri Android 构建辅助工具（perl/make 等下载的二进制，本地自动补齐）
+.android-tools/
+
+# ===== 运行时数据（测试客户端 / mailbox 节点目录）=====
+# 内含 secret.key（长期身份）、vault.json（密码 verifier）、*.db、
+# 复制的 .exe 与节点日志，均不应入库。
+client0/
+client1/
+mailbox0/
+mailbox1/
+*.db
+*.db-wal
+*.db-shm
+
+# ===== 密钥与敏感文件 =====
+secret.key
+*.key
+vault.json
+mailbox.json
+mailboxes.json
+keystore.properties
+key.properties
+
+# ===== 日志 =====
+*.log
+run.out
+run.err
+
+# ===== 编辑器 / 系统 =====
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.tmp
+*.swp

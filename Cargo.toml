@@ -1,0 +1,23 @@
+# PrivChat 工作区：统一三个 crate 的依赖解析与编译缓存。
+#
+# 成员：
+# - privchat-client/src-tauri : Tauri 应用（Android / 桌面客户端）
+# - privchat-common           : mailbox 客户端 / 节点共享 wire 协议与 PoW
+# - privchat-mailbox          : 离线消息缓存节点（可组网同步）
+#
+# 各成员自带 `[profile.release]`（LTO 等），但 workspace 内成员级 profile
+# 会被忽略，故此处统一定义（值需与成员保持同步，尤其 WSL 独立构建）。
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[workspace]
+resolver = "2"
+members = [
+    "privchat-client/src-tauri",
+    "privchat-common",
+    "privchat-mailbox",
+]

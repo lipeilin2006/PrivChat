@@ -1,0 +1,13 @@
+[package]
+name = "privchat-common"
+version = "0.1.0"
+edition = "2021"
+description = "PrivChat 共享协议层：mailbox 客户端/节点间的 wire 协议与 PoW"
+
+[dependencies]
+anyhow = "1"
+iroh = "1.0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["time"] }

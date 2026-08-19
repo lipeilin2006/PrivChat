@@ -1,0 +1,228 @@
+//! PrivChat 共享协议层：mailbox 客户端与 mailbox 节点之间的 wire 协议与 PoW。
+//!
+//! 客户端（`privchat-client`）与节点（`privchat-mailbox`）各自依赖本 crate，
+//! 保证请求/响应结构与常量只维护一份，避免两处复制导致漂移。
+//!
+//! 协议：每条 QUIC bi-stream 一次请求。客户端写入 JSON 的
+//! [`MailboxRequest`]，节点写回 JSON 的 [`MailboxResponse`]。
+//! 可选操作码见 [`Op`]：`put`/`fetch` 由客户端使用；
+//! `sync`/`sync_ack` 由节点间组网同步使用。
+
+use anyhow::{anyhow, Result};
+use iroh::Endpoint;
+use iroh::endpoint::presets;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// mailbox 节点唯一 ALPN：与客户端聊天 ALPN 区分。
+pub const ALPN: &[u8] = b"privchat/mailbox";
+
+/// 单条邮件容量上限（密文，含 overhead）。
+pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// PoW 难度：`SHA-256(to || payload || nonce)` 摘要的前导零**字节**数。
+///
+/// 平均约 `256^1 = 256` 次尝试，秒级完成，但足以把灌垃圾的成本抬高一个
+/// 数量级。仅客户端 → 节点 `put` 需要；节点间 `sync` 走内部通道，不验证。
+pub const POW_DIFFICULTY: usize = 1;
+
+/// 计算一次 PoW 挑战的摘要输入：`to || payload || nonce`（nonce 小端 8 字节）。
+fn pow_input(to: &str, payload: &[u8], nonce: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(to.len() + payload.len() + 8);
+    buf.extend_from_slice(to.as_bytes());
+    buf.extend_from_slice(payload);
+    buf.extend_from_slice(&nonce.to_le_bytes());
+    buf
+}
+
+/// 校验 nonce 是否满足 PoW 难度。
+pub fn verify_pow(to: &str, payload: &[u8], nonce: u64) -> bool {
+    let digest = Sha256::digest(pow_input(to, payload, nonce));
+    digest[..POW_DIFFICULTY].iter().all(|&b| b == 0)
+}
+
+/// 暴力搜索满足难度的 nonce（从 0 递增）。对 1 字节难度平均 256 次。
+pub fn find_pow(to: &str, payload: &[u8]) -> u64 {
+    let mut nonce = 0u64;
+    loop {
+        if verify_pow(to, payload, nonce) {
+            return nonce;
+        }
+        nonce = nonce.wrapping_add(1);
+    }
+}
+
+/// 请求方 → 节点请求。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MailboxRequest {
+    #[serde(rename = "op")]
+    pub op: Op,
+    /// put 的接收方 peer_id / sync_ack 的目标接收方。
+    #[serde(rename = "to", default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// fetch 的目标接收方 peer_id。
+    #[serde(rename = "for", default, skip_serializing_if = "Option::is_none")]
+    pub for_peer: Option<String>,
+    /// put 的消息 ID（发送方从加密头 (gen,n) 派生的逻辑发送序）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// fetch 返回后广播删除 / sync_ack 的消息 ID 列表。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<String>>,
+    /// put 的密文消息体。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<u8>>,
+    /// put 的工作量证明 nonce。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    /// sync 广播的完整消息。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<StoredMessage>,
+}
+
+impl MailboxRequest {
+    pub fn put(to: &str, id: &str, payload: Vec<u8>, nonce: u64) -> Self {
+        Self {
+            op: Op::Put,
+            to: Some(to.to_string()),
+            for_peer: None,
+            id: Some(id.to_string()),
+            ids: None,
+            payload: Some(payload),
+            nonce: Some(nonce),
+            msg: None,
+        }
+    }
+
+    pub fn fetch(for_peer: &str) -> Self {
+        Self {
+            op: Op::Fetch,
+            to: None,
+            for_peer: Some(for_peer.to_string()),
+            id: None,
+            ids: None,
+            payload: None,
+            nonce: None,
+            msg: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Op {
+    Put,
+    Fetch,
+    Sync,
+    SyncAck,
+}
+
+/// 节点 → 请求方响应。
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MailboxResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// fetch 命中的待收密文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<StoredMessage>>,
+}
+
+/// 存储在邮箱里的密文消息。`to_peer_id` 是接收方的专属身份（各联系人
+/// 身份互不相同），节点按它分类队列；`from` 可省——队列只属于唯一一个
+/// 发送方，接收方由自己的 `local_id` 在联系人表唯一推出对方 peer_id。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredMessage {
+    /// 消息 ID（客户端从加密头 (gen,n) 派生，全局唯一）。
+    pub msg_id: String,
+    /// 接收方 peer_id（按此分类队列）。
+    pub to_peer_id: String,
+    /// 应用层加密后的消息内容（含文本与时间）。
+    pub msg: Vec<u8>,
+}
+
+impl StoredMessage {
+    /// 从 put 请求解析出完整消息。
+    pub fn from_request(r: &MailboxRequest) -> Result<Self> {
+        Ok(Self {
+            msg_id: r.id.clone().ok_or_else(|| anyhow!("put missing id"))?,
+            to_peer_id: r.to.clone().ok_or_else(|| anyhow!("put missing to"))?,
+            msg: r
+                .payload
+                .clone()
+                .ok_or_else(|| anyhow!("put missing payload"))?,
+        })
+    }
+}
+
+/// 单次请求的总体超时（拨号 + 写入 + 读响应）。节点失联/无响应时
+/// 客户端轮询与节点间同步不能被无限阻塞。
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 向单个 mailbox 节点发一个请求，返回响应。
+pub async fn send_request(
+    endpoint: &Endpoint,
+    peer_id: &str,
+    req: &MailboxRequest,
+) -> Result<MailboxResponse> {
+    let addr_id: iroh::EndpointId = peer_id
+        .parse()
+        .map_err(|_| anyhow!("invalid peer id: {peer_id}"))?;
+    let conn = tokio::time::timeout(REQUEST_TIMEOUT, endpoint.connect(iroh::EndpointAddr::new(addr_id), ALPN))
+        .await
+        .map_err(|_| anyhow!("connect to {peer_id} timed out"))??;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&serde_json::to_vec(req)?).await?;
+    send.finish()?;
+    let payload = tokio::time::timeout(REQUEST_TIMEOUT, recv.read_to_end(MAX_PAYLOAD))
+        .await
+        .map_err(|_| anyhow!("waiting response from {peer_id} timed out"))??;
+    let resp: MailboxResponse = serde_json::from_slice(&payload)
+        .map_err(|e| anyhow!("bad mailbox response: {e}"))?;
+    Ok(resp)
+}
+
+/// 创建一个拨号用 Endpoint（与节点同配置，保证地址可解析）。
+pub async fn make_endpoint(secret_key: iroh::SecretKey) -> Result<Endpoint> {
+    Ok(Endpoint::builder(presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_pow_yields_valid_nonce() {
+        let to = "recipient-peer-id";
+        let payload = b"ciphertext payload".to_vec();
+        let nonce = find_pow(to, &payload);
+        assert!(verify_pow(to, &payload, nonce));
+    }
+
+    #[test]
+    fn verify_pow_rejects_wrong_nonce() {
+        let to = "recipient-peer-id";
+        let payload = b"ciphertext payload".to_vec();
+        let nonce = find_pow(to, &payload);
+        assert!(!verify_pow(to, &payload, nonce.wrapping_add(1)), "neighbor nonce must fail");
+        // 改 payload 后原 nonce 不应再有效。
+        let other = b"different payload".to_vec();
+        assert!(!verify_pow(to, &other, nonce), "payload change must invalidate nonce");
+    }
+
+    #[test]
+    fn request_roundtrip_serde() {
+        let req = MailboxRequest::put("to-peer", "msg-1", vec![1, 2, 3], 42);
+        let bytes = serde_json::to_vec(&req).unwrap();
+        let back: MailboxRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.op, Op::Put);
+        assert_eq!(back.to.as_deref(), Some("to-peer"));
+        assert_eq!(back.id.as_deref(), Some("msg-1"));
+        assert_eq!(back.payload.as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(back.nonce, Some(42));
+    }
+}

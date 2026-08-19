@@ -1,0 +1,10 @@
+//! PrivChat Mailbox 共享库：协议类型 + 客户端/节点间发送原语。
+//!
+//! 协议本体统一放在 `privchat-common`（见 [`privchat_common`]），本 crate
+//! 只是转发，供 `main.rs`（节点本体）与 `examples/client.rs`（命令行测试
+//! 客户端）按原有路径 `privchat_mailbox::*` 引用。
+
+pub use privchat_common::{
+    find_pow, make_endpoint, send_request, verify_pow, ALPN, MAX_PAYLOAD, POW_DIFFICULTY,
+    MailboxRequest, MailboxResponse, Op, StoredMessage,
+};
