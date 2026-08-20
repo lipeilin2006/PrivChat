@@ -1,7 +1,8 @@
 use super::*;
 
 fn temp_db(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("privchat-mailbox-db-{name}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("privchat-mailbox-db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("mailbox.db")
@@ -32,10 +33,52 @@ async fn put_fetch_roundtrip() {
     // 重开库（模拟重启）持久化已删除状态。
     drop(store);
     let reopened = MailboxStore::open(path.clone(), 0).expect("reopen");
-    assert!(reopened.fetch("peer-a").await.expect("fetch again").is_empty());
+    assert!(reopened
+        .fetch("peer-a")
+        .await
+        .expect("fetch again")
+        .is_empty());
     // 重新入库后 fetch 再次取回即删。
     reopened.put(msg.clone(), 100).await.expect("put again");
-    assert_eq!(reopened.fetch("peer-a").await.expect("fetch again 2").len(), 1);
+    assert_eq!(
+        reopened.fetch("peer-a").await.expect("fetch again 2").len(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn message_id_is_scoped_to_recipient_and_payload() {
+    let path = temp_db("message-key");
+    let store = MailboxStore::open(path.clone(), 0).expect("open");
+    let first = StoredMessage {
+        msg_id: "same-id".into(),
+        to_peer_id: "peer-a".into(),
+        msg: b"first".to_vec(),
+    };
+    assert!(store.put(first.clone(), 100).await.expect("first put"));
+
+    // 同一收件人和 ID 仅在 payload 完全相同时幂等。
+    assert!(!store.put(first, 101).await.expect("idempotent put"));
+    let conflict = StoredMessage {
+        msg_id: "same-id".into(),
+        to_peer_id: "peer-a".into(),
+        msg: b"different".to_vec(),
+    };
+    assert!(store.put(conflict, 102).await.is_err());
+
+    // 不同收件人的相同 ID 是独立消息，不得互相抢占。
+    let other_recipient = StoredMessage {
+        msg_id: "same-id".into(),
+        to_peer_id: "peer-b".into(),
+        msg: b"second".to_vec(),
+    };
+    assert!(store
+        .put(other_recipient, 103)
+        .await
+        .expect("other recipient"));
+    assert_eq!(store.fetch("peer-a").await.unwrap().len(), 1);
+    assert_eq!(store.fetch("peer-b").await.unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
@@ -43,10 +86,7 @@ async fn put_fetch_roundtrip() {
 /// 「取回即删」式 DoS）；本人正常拉取。
 #[tokio::test]
 async fn fetch_forbidden_for_other_identity() {
-    let dir = std::env::temp_dir().join(format!(
-        "privchat-mailbox-authz-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("privchat-mailbox-authz-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let store = MailboxStore::open(dir.join("mb.db"), 0).expect("open");
@@ -105,15 +145,64 @@ async fn fetch_forbidden_for_other_identity() {
 
     // 本人 fetch → 成功并取回即删。
     let req = MailboxRequest::fetch(&victim);
-    let resp = handle_request(
-        &handler,
-        &victim,
-        &serde_json::to_vec(&req).expect("ser"),
-    )
-    .await;
+    let resp = handle_request(&handler, &victim, &serde_json::to_vec(&req).expect("ser")).await;
     assert!(resp.ok, "owner fetch must succeed: {:?}", resp.error);
     assert_eq!(resp.messages.expect("messages").len(), 1);
-    assert!(handler.store.fetch(&victim).await.expect("drained").is_empty());
+    assert!(handler
+        .store
+        .fetch(&victim)
+        .await
+        .expect("drained")
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sync_ack_forbidden_for_non_mailbox_peer() {
+    let dir = std::env::temp_dir().join(format!(
+        "privchat-mailbox-sync-authz-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = MailboxStore::open(dir.join("mb.db"), 0).expect("open");
+    store
+        .put(
+            StoredMessage {
+                msg_id: "m".into(),
+                to_peer_id: "victim".into(),
+                msg: vec![],
+            },
+            100,
+        )
+        .await
+        .expect("put");
+    let endpoint = privchat_mailbox::make_endpoint(iroh::SecretKey::generate())
+        .await
+        .expect("endpoint");
+    let handler = MailboxHandler {
+        store: store.clone(),
+        endpoint,
+        peers: Arc::new(vec!["trusted-mailbox".into()]),
+    };
+    let req = MailboxRequest {
+        op: Op::SyncAck,
+        to: Some("victim".into()),
+        ids: Some(vec!["m".into()]),
+        for_peer: None,
+        id: None,
+        payload: None,
+        msg: None,
+        nonce: None,
+    };
+    let resp = handle_request(
+        &handler,
+        "attacker",
+        &serde_json::to_vec(&req).expect("serialize"),
+    )
+    .await;
+    assert!(!resp.ok, "untrusted sync_ack must fail");
+    assert_eq!(store.fetch("victim").await.expect("fetch").len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -122,10 +211,7 @@ async fn fetch_forbidden_for_other_identity() {
 /// 必须恰好各节点新增一次；环回（mb2 再发回 mb0）必须返回 false。
 #[tokio::test]
 async fn chain_forwarding_stops_on_duplicate() {
-    let dir = std::env::temp_dir().join(format!(
-        "privchat-mailbox-chain-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("privchat-mailbox-chain-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -156,20 +242,21 @@ async fn chain_forwarding_stops_on_duplicate() {
 /// 重复删除返回 0（不再转发），切断环路。
 #[tokio::test]
 async fn sync_ack_returns_deleted_count_for_loop_cut() {
-    let dir = std::env::temp_dir().join(format!(
-        "privchat-mailbox-ackcount-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("privchat-mailbox-ackcount-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     let store = MailboxStore::open(dir.join("ack.db"), 0).expect("open");
     store
-        .put(StoredMessage {
-            msg_id: "m".into(),
-            to_peer_id: "a".into(),
-            msg: vec![],
-        }, 100)
+        .put(
+            StoredMessage {
+                msg_id: "m".into(),
+                to_peer_id: "a".into(),
+                msg: vec![],
+            },
+            100,
+        )
         .await
         .expect("put");
     // 首次 ack 删除 1 行 → 可继续转发。
@@ -255,46 +342,5 @@ async fn ttl_purges_expired_rows() {
         .await
         .expect("put forever");
     assert_eq!(store2.purge_expired(now).await.expect("purge off"), 0);
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
-}
-
-/// 存量库迁移：旧表无 time 列 → 补列，历史行 time=0（视为立即过期，
-/// 随首次 TTL 清理删除）；新消息正常留存。
-#[tokio::test]
-async fn legacy_db_migrates_time_column() {
-    let path = temp_db("legacy");
-    let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE messages (
-             msg_id      TEXT PRIMARY KEY,
-             to_peer_id  TEXT NOT NULL,
-             msg         BLOB NOT NULL
-         );",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (msg_id, to_peer_id, msg) VALUES ('legacy', 'q', x'00')",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let store = MailboxStore::open(path.clone(), 1).expect("open legacy");
-    store
-        .put(
-            StoredMessage {
-                msg_id: "new".into(),
-                to_peer_id: "q".into(),
-                msg: vec![],
-            },
-            now_ms(),
-        )
-        .await
-        .expect("put new");
-    // legacy(time=0) 过期清除；new 保留。
-    assert_eq!(store.purge_expired(now_ms()).await.expect("purge"), 1);
-    let fetched = store.fetch("q").await.expect("fetch");
-    assert_eq!(fetched.len(), 1);
-    assert_eq!(fetched[0].msg_id, "new");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

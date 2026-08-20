@@ -4,8 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { Format, scan, cancel, requestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 import QRCode from "qrcode";
 import { useQuasar } from "quasar";
+import { useI18n } from "../i18n";
 
 const $q = useQuasar();
+const { t } = useI18n();
 
 const emit = defineEmits(["close", "added"]);
 
@@ -44,7 +46,7 @@ async function loadMyId() {
     }
   } catch (e) {
     loadingId.value = false;
-    $q.notify({ type: "negative", message: `Failed to create ID: ${e}` });
+    $q.notify({ type: "negative", message: t("id.idCreated", { error: e }) });
   }
 }
 
@@ -56,9 +58,9 @@ async function copyMyId() {
   try {
     await navigator.clipboard.writeText(myId.value);
     copied.value = "ID";
-    $q.notify({ type: "positive", message: "ID copied", position: "bottom" });
+    $q.notify({ type: "positive", message: t("id.copied"), position: "bottom" });
   } catch (e) {
-    $q.notify({ type: "negative", message: `Copy failed: ${e}`, position: "bottom" });
+    $q.notify({ type: "negative", message: t("id.copyFailed", { error: e }), position: "bottom" });
   } finally {
     setTimeout(() => {
       copied.value = "";
@@ -70,31 +72,27 @@ async function startScan() {
   scanning.value = true;
   document.body.classList.add("scanning-active");
   try {
-    console.log("[scan] requesting permissions...");
     const perm = await requestPermissions();
     const cameraState = typeof perm === "string" ? perm : (perm && perm.camera);
-    console.log("[scan] permission state:", cameraState);
     if (cameraState !== "granted") {
       $q.notify({
         type: "warning",
-        message: "Camera permission required to scan a QR code",
+        message: t("id.cameraPermission"),
         position: "bottom",
       });
       return;
     }
-    console.log("[scan] starting scan");
     const { content } = await scan({
       formats: [Format.QRCode],
       windowed: true,
     });
-    console.log("[scan] result:", content);
     ticket.value = content.trim();
   } catch (e) {
     console.error("[scan] error:", e, e && e.message);
     if (scanning.value) {
       $q.notify({
         type: "warning",
-        message: `Camera scan unavailable: ${e}`,
+        message: t("id.scanUnavailable", { error: e }),
         position: "bottom",
       });
     }
@@ -117,7 +115,7 @@ async function submit() {
   if (!ticket.value.trim()) {
     $q.notify({
       type: "warning",
-      message: "Please paste a connection ticket",
+      message: t("id.pasteTicket"),
       position: "bottom",
     });
     return;
@@ -130,7 +128,7 @@ async function submit() {
     });
     $q.notify({
       type: "positive",
-      message: "Contact added",
+      message: t("id.added"),
       position: "bottom",
     });
     // 清空添加联系人输入框，并刷新生成一个新的 ID（邀请码）。
@@ -141,7 +139,7 @@ async function submit() {
   } catch (e) {
     $q.notify({
       type: "negative",
-      message: `Connect failed: ${e}`,
+      message: t("id.connectFailed", { error: e }),
       position: "bottom",
     });
   } finally {
@@ -156,18 +154,18 @@ onMounted(loadMyId);
   <div class="my-id" :class="{ 'is-scanning': scanning }">
     <div class="myid-header">
       <q-btn flat round dense icon="arrow_back" color="grey-4" @click="emit('close')" />
-      <span class="text-subtitle2">My ID</span>
+       <span class="text-subtitle2">{{ t("id.title") }}</span>
     </div>
 
     <div class="myid-scroll">
       <!-- 我的 ID：进入先加载，成功后展示 id + 二维码，可手动刷新 -->
       <div v-if="loadingId" class="id-loading">
         <q-spinner color="primary" size="48px" />
-        <div class="text-grey-6 q-mt-md">Creating your ID…</div>
+         <div class="text-grey-6 q-mt-md">{{ t("id.creating") }}</div>
       </div>
 
       <div v-else class="id-card">
-        <div class="id-title">Scan to add me</div>
+         <div class="id-title">{{ t("id.scanToAdd") }}</div>
         <canvas ref="qrCanvas" class="qr-canvas" />
         <div class="id-value mono">{{ myId }}</div>
         <div class="id-actions">
@@ -176,7 +174,7 @@ onMounted(loadMyId);
             outline
             no-caps
             color="primary"
-            label="Copy ID"
+             :label="t('id.copy')"
             class="full-width q-mb-sm"
             :loading="copied === 'ID'"
             @click="copyMyId"
@@ -185,26 +183,26 @@ onMounted(loadMyId);
             unelevated
             no-caps
             color="primary"
-            label="Refresh ID"
+             :label="t('id.refresh')"
             class="full-width"
             @click="refreshMyId"
           />
         </div>
         <div class="id-hint text-grey-6">
-          Each refresh creates a new ID. Share it with one person to connect.
+           {{ t("id.hint") }}
         </div>
       </div>
 
       <!-- 添加联系人 -->
       <div class="add-section">
-        <div class="add-title">Add contact</div>
+         <div class="add-title">{{ t("id.addTitle") }}</div>
         <div class="form q-gutter-md">
           <q-input
             v-model="name"
             :dark="$q.dark.isActive"
             filled
             color="primary"
-            label="Display name"
+             :label="t('id.displayName')"
             placeholder="Alice"
             autocomplete="off"
           />
@@ -214,9 +212,9 @@ onMounted(loadMyId);
             filled
             color="primary"
             type="textarea"
-            label="Peer ID"
-            placeholder="Paste the peer's ID…"
-            :rules="[(v) => v.trim().length > 0 || 'Peer ID is required']"
+             :label="t('id.peerId')"
+             :placeholder="t('id.peerPlaceholder')"
+             :rules="[(v) => v.trim().length > 0 || t('id.required')]"
             autogrow
           />
           <q-btn
@@ -225,7 +223,7 @@ onMounted(loadMyId);
             no-caps
             color="primary"
             icon="qr_code_scanner"
-            label="Scan QR code"
+             :label="t('id.scan')"
             class="form-btn"
             :loading="scanning"
             @click="startScan"
@@ -234,7 +232,7 @@ onMounted(loadMyId);
             unelevated
             no-caps
             color="primary"
-            label="Add"
+             :label="t('common.add')"
             icon="person_add"
             class="form-btn"
             :loading="loadingAdd"
@@ -257,7 +255,7 @@ onMounted(loadMyId);
           color="white"
           text-color="black"
           icon="close"
-          label="Cancel"
+           :label="t('common.cancel')"
           class="scan-cancel"
           @click="stopScan"
         />

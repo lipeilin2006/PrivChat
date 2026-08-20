@@ -29,7 +29,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::SecretKey;
@@ -41,13 +41,13 @@ use privchat_mailbox::{MailboxRequest, MailboxResponse, Op, StoredMessage, ALPN,
 /// 内存邮箱 + SQLite 持久化。
 ///
 /// 单表 `messages`：
-/// - `msg_id`      TEXT PRIMARY KEY —— 发送方派生 ID，去重 + 排序（`INSERT OR IGNORE` 幂等）
+/// - `msg_id`      TEXT —— 发送方派生 ID，与 to_peer_id 组成主键，去重 + 排序
 /// - `to_peer_id`  TEXT NOT NULL —— 接收方身份（按此分类队列）
 /// - `msg`         BLOB NOT NULL —— 应用层密文
 /// - `time`        INTEGER NOT NULL —— 入库时间（毫秒），TTL 到期清除依据
 ///
 /// 另建 `idx_messages_to` 索引加速按接收方拉取。仅存密文与路由元数据，
-/// 节点不接触明文，与旧 `mailbox.json` 行为一致。
+/// 节点不接触明文。
 #[derive(Clone)]
 struct MailboxStore {
     conn: Arc<Mutex<SqlConn>>,
@@ -58,34 +58,27 @@ struct MailboxStore {
 
 impl std::fmt::Debug for MailboxStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MailboxStore").field("path", &self.path).finish()
+        f.debug_struct("MailboxStore")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
 impl MailboxStore {
-    /// 打开（或创建）SQLite 库，建表 + 索引，并对存量库迁移 `time` 列。
+    /// 打开（或创建）当前版本 SQLite 库并建立表结构。
     fn open(path: PathBuf, ttl_secs: u64) -> Result<Self> {
         let conn = SqlConn::open(&path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS messages (
-                 msg_id      TEXT PRIMARY KEY,
+                 msg_id      TEXT NOT NULL,
                  to_peer_id  TEXT NOT NULL,
                  msg         BLOB NOT NULL,
-                 time        INTEGER NOT NULL DEFAULT 0
+                 time        INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (to_peer_id, msg_id)
              );
              CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_peer_id);",
         )?;
-        // 存量库迁移：旧表无 time 列 → 补列，历史行置 0（视为立即过期，
-        // 随首次 TTL 清理删除；旧客户端消息本就被新棘轮视为不可解）。
-        let cols: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if !cols.iter().any(|c| c == "time") {
-            conn.execute_batch("ALTER TABLE messages ADD COLUMN time INTEGER NOT NULL DEFAULT 0;")?;
-        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -93,14 +86,26 @@ impl MailboxStore {
         })
     }
 
-    /// 存入一条消息；按 msg_id 幂等去重，返回是否真正新增。
+    /// 存入一条消息；同一 (接收方,msg_id,payload) 幂等，不同 payload 冲突。
     async fn put(&self, msg: StoredMessage, time: u64) -> Result<bool> {
         let conn = self.conn.lock().await;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, to_peer_id, msg, time) VALUES (?1, ?2, ?3, ?4)",
             params![msg.msg_id, msg.to_peer_id, msg.msg, time as i64],
         )?;
-        Ok(inserted == 1)
+        if inserted == 1 {
+            return Ok(true);
+        }
+        let same_payload: bool = conn.query_row(
+            "SELECT msg = ?3 FROM messages WHERE to_peer_id = ?1 AND msg_id = ?2",
+            params![msg.to_peer_id, msg.msg_id, msg.msg],
+            |row| row.get(0),
+        )?;
+        if same_payload {
+            Ok(false)
+        } else {
+            Err(anyhow!("msg_id conflict with different payload"))
+        }
     }
 
     /// 拉取某接收方队列的全部密文（按 `msg_id` 升序），返回后**立即删除**
@@ -146,7 +151,10 @@ impl MailboxStore {
         }
         let cutoff = now_ms.saturating_sub(self.ttl_secs * 1000);
         let conn = self.conn.lock().await;
-        let deleted = conn.execute("DELETE FROM messages WHERE time < ?1", params![cutoff as i64])?;
+        let deleted = conn.execute(
+            "DELETE FROM messages WHERE time < ?1",
+            params![cutoff as i64],
+        )?;
         Ok(deleted)
     }
 
@@ -159,9 +167,8 @@ impl MailboxStore {
         }
         let conn = self.conn.lock().await;
         let placeholders = vec!["?"; ids.len()].join(",");
-        let sql = format!(
-            "DELETE FROM messages WHERE to_peer_id = ?1 AND msg_id IN ({placeholders})"
-        );
+        let sql =
+            format!("DELETE FROM messages WHERE to_peer_id = ?1 AND msg_id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         stmt.raw_bind_parameter(1, recipient)?;
         for (i, id) in ids.iter().enumerate() {
@@ -209,13 +216,23 @@ impl ProtocolHandler for MailboxHandler {
     }
 }
 
-async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8]) -> MailboxResponse {
+async fn handle_request(
+    handler: &MailboxHandler,
+    remote_id: &str,
+    payload: &[u8],
+) -> MailboxResponse {
     let req: MailboxRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
         Err(e) => return err(&format!("bad request: {e}")),
     };
+    if matches!(req.op, Op::Sync | Op::SyncAck)
+        && !handler.peers.iter().any(|peer| peer == remote_id)
+    {
+        return err("mailbox sync forbidden: sender is not a configured peer");
+    }
 
     match req.op {
+        Op::Ping => ok(),
         Op::Put => match StoredMessage::from_request(&req) {
             Ok(msg) => {
                 if msg.msg.len() > MAX_PAYLOAD {
@@ -228,10 +245,11 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                 }
                 match handler.store.put(msg.clone(), now_ms()).await {
                     Ok(true) => {
-                        // 已新增：广播给其他 mailbox 节点同步。
-                        broadcast(
-                            &handler.endpoint,
-                            &handler.peers,
+                        // 本地持久化后立即响应；网格同步转后台，避免慢 peer
+                        // 让客户端误判 PUT 超时并回滚发送棘轮。
+                        spawn_broadcast(
+                            handler.endpoint.clone(),
+                            handler.peers.clone(),
                             MailboxRequest {
                                 op: Op::Sync,
                                 msg: Some(msg),
@@ -242,8 +260,7 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                                 payload: None,
                                 nonce: None,
                             },
-                        )
-                        .await;
+                        );
                         ok()
                     }
                     Ok(false) => ok(), // msg_id 已存在，幂等
@@ -266,11 +283,10 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                     // 取回即删：本节点已删除，向 peer 广播删除意图，
                     // 网格同步清掉其他节点的副本。
                     if !messages.is_empty() {
-                        let ids: Vec<String> =
-                            messages.iter().map(|m| m.msg_id.clone()).collect();
-                        broadcast(
-                            &handler.endpoint,
-                            &handler.peers,
+                        let ids: Vec<String> = messages.iter().map(|m| m.msg_id.clone()).collect();
+                        spawn_broadcast(
+                            handler.endpoint.clone(),
+                            handler.peers.clone(),
                             MailboxRequest {
                                 op: Op::SyncAck,
                                 to: Some(recipient),
@@ -281,8 +297,7 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                                 msg: None,
                                 nonce: None,
                             },
-                        )
-                        .await;
+                        );
                     }
                     MailboxResponse {
                         ok: true,
@@ -300,9 +315,9 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
             match req.msg {
                 Some(msg) => match handler.store.put(msg.clone(), now_ms()).await {
                     Ok(true) => {
-                        broadcast(
-                            &handler.endpoint,
-                            &handler.peers,
+                        spawn_broadcast(
+                            handler.endpoint.clone(),
+                            handler.peers.clone(),
                             MailboxRequest {
                                 op: Op::Sync,
                                 msg: Some(msg),
@@ -313,8 +328,7 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                                 payload: None,
                                 nonce: None,
                             },
-                        )
-                        .await;
+                        );
                         ok()
                     }
                     Ok(false) => ok(), // 已存在，幂等，不再转发
@@ -334,9 +348,9 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                     // 本节点确实删除了消息才继续转发；否则说明已删除过，
                     // 不再广播，切断环路。
                     if deleted > 0 {
-                        broadcast(
-                            &handler.endpoint,
-                            &handler.peers,
+                        spawn_broadcast(
+                            handler.endpoint.clone(),
+                            handler.peers.clone(),
                             MailboxRequest {
                                 op: Op::SyncAck,
                                 to: Some(recipient),
@@ -347,8 +361,7 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
                                 msg: None,
                                 nonce: None,
                             },
-                        )
-                        .await;
+                        );
                     }
                     ok()
                 }
@@ -358,13 +371,27 @@ async fn handle_request(handler: &MailboxHandler, remote_id: &str, payload: &[u8
     }
 }
 
-/// 向所有 peer mailbox 广播一个请求（尽力而为，逐个尝试）。
-async fn broadcast(endpoint: &iroh::Endpoint, peers: &[String], req: MailboxRequest) {
-    for peer in peers {
-        if let Err(e) = privchat_mailbox::send_request(endpoint, peer, &req).await {
-            eprintln!("[mailbox] sync to {peer} failed: {e}");
+/// 本地操作完成后在后台向所有 peer mailbox 并发广播，避免阻塞客户端响应。
+fn spawn_broadcast(endpoint: iroh::Endpoint, peers: Arc<Vec<String>>, req: MailboxRequest) {
+    tokio::spawn(async move {
+        let mut requests = tokio::task::JoinSet::new();
+        let req = Arc::new(req);
+        for peer in peers.iter().cloned() {
+            let endpoint = endpoint.clone();
+            let req = Arc::clone(&req);
+            requests.spawn(async move {
+                let result = privchat_mailbox::send_request(&endpoint, &peer, req.as_ref()).await;
+                (peer, result)
+            });
         }
-    }
+        while let Some(result) = requests.join_next().await {
+            match result {
+                Ok((peer, Err(e))) => eprintln!("[mailbox] sync to {peer} failed: {e}"),
+                Err(e) => eprintln!("[mailbox] sync task failed: {e}"),
+                Ok((_, Ok(_))) => {}
+            }
+        }
+    });
 }
 
 fn ok() -> MailboxResponse {
@@ -438,9 +465,12 @@ fn load_ttl(data_dir: &std::path::Path) -> u64 {
 fn ensure_config_files(data_dir: &std::path::Path, ttl_secs: u64, peers: &[String]) -> Result<()> {
     let cfg_path = data_dir.join("config.json");
     if !cfg_path.exists() {
-        std::fs::write(&cfg_path, serde_json::to_string_pretty(&serde_json::json!({
-            "ttl_secs": ttl_secs,
-        }))?)?;
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ttl_secs": ttl_secs,
+            }))?,
+        )?;
         eprintln!("[mailbox] wrote {}", cfg_path.display());
     }
     let peers_path = data_dir.join("mailboxes.json");
@@ -456,7 +486,11 @@ async fn main() -> Result<()> {
     let data_dir = std::env::var("PRIVCHAT_MAILBOX_DATA_DIR")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| std::env::current_exe().ok().and_then(|e| e.parent().map(PathBuf::from)))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(PathBuf::from))
+        })
         .unwrap_or_else(|| std::env::temp_dir().join("privchat-mailbox"));
     std::fs::create_dir_all(&data_dir)?;
 
@@ -498,8 +532,7 @@ async fn main() -> Result<()> {
         let purge_store = store.clone();
         let interval_secs = (ttl_secs / 4).clamp(60, 3600);
         tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
             ticker.tick().await; // 跳过首拍
             loop {
                 ticker.tick().await;
@@ -514,11 +547,7 @@ async fn main() -> Result<()> {
 
     // 等待上线（联系上 relay），确保客户端可拨号。
     // 加限时：relay 不可达（离线/被墙/内网环境）时不阻塞启动。
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        endpoint.online(),
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), endpoint.online()).await;
 
     let id = endpoint.id();
     println!("PrivChat Mailbox online");

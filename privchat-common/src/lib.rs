@@ -6,11 +6,11 @@
 //! 协议：每条 QUIC bi-stream 一次请求。客户端写入 JSON 的
 //! [`MailboxRequest`]，节点写回 JSON 的 [`MailboxResponse`]。
 //! 可选操作码见 [`Op`]：`put`/`fetch` 由客户端使用；
-//! `sync`/`sync_ack` 由节点间组网同步使用。
+//! `sync`/`sync_ack` 由节点间组网同步使用，`ping` 用于健康检查。
 
 use anyhow::{anyhow, Result};
-use iroh::Endpoint;
 use iroh::endpoint::presets;
+use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -113,6 +113,7 @@ impl MailboxRequest {
 pub enum Op {
     Put,
     Fetch,
+    Ping,
     Sync,
     SyncAck,
 }
@@ -168,17 +169,20 @@ pub async fn send_request(
     let addr_id: iroh::EndpointId = peer_id
         .parse()
         .map_err(|_| anyhow!("invalid peer id: {peer_id}"))?;
-    let conn = tokio::time::timeout(REQUEST_TIMEOUT, endpoint.connect(iroh::EndpointAddr::new(addr_id), ALPN))
-        .await
-        .map_err(|_| anyhow!("connect to {peer_id} timed out"))??;
+    let conn = tokio::time::timeout(
+        REQUEST_TIMEOUT,
+        endpoint.connect(iroh::EndpointAddr::new(addr_id), ALPN),
+    )
+    .await
+    .map_err(|_| anyhow!("connect to {peer_id} timed out"))??;
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&serde_json::to_vec(req)?).await?;
     send.finish()?;
     let payload = tokio::time::timeout(REQUEST_TIMEOUT, recv.read_to_end(MAX_PAYLOAD))
         .await
         .map_err(|_| anyhow!("waiting response from {peer_id} timed out"))??;
-    let resp: MailboxResponse = serde_json::from_slice(&payload)
-        .map_err(|e| anyhow!("bad mailbox response: {e}"))?;
+    let resp: MailboxResponse =
+        serde_json::from_slice(&payload).map_err(|e| anyhow!("bad mailbox response: {e}"))?;
     Ok(resp)
 }
 
@@ -208,10 +212,16 @@ mod tests {
         let to = "recipient-peer-id";
         let payload = b"ciphertext payload".to_vec();
         let nonce = find_pow(to, &payload);
-        assert!(!verify_pow(to, &payload, nonce.wrapping_add(1)), "neighbor nonce must fail");
+        assert!(
+            !verify_pow(to, &payload, nonce.wrapping_add(1)),
+            "neighbor nonce must fail"
+        );
         // 改 payload 后原 nonce 不应再有效。
         let other = b"different payload".to_vec();
-        assert!(!verify_pow(to, &other, nonce), "payload change must invalidate nonce");
+        assert!(
+            !verify_pow(to, &other, nonce),
+            "payload change must invalidate nonce"
+        );
     }
 
     #[test]

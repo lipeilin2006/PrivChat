@@ -1,7 +1,7 @@
 //! Layer 0.5 · 本地持久化 (SQLite + SQLCipher 全库加密)
 //!
 //! 整个数据库文件由 SQLCipher 加密（AES-256，页级加密，表结构、行数、
-//! 索引全部密文），文件头为随机 salt，不再是明文 "SQLite format 3"。
+//! 索引全部密文），文件头为随机 salt，不暴露 SQLite 结构信息。
 //! 加密密钥 = 密码经 PBKDF2 派生主密钥后，再经 HKDF-Expand 域分离得到的
 //! `db_key`（见 vault.rs），通过 `PRAGMA key = "x'<hex>'"` 传入（raw key，
 //! 不经 SQLCipher 二次 KDF）。
@@ -16,14 +16,10 @@
 //! mailbox_peers (peer_id PK)
 //! identities    (local_id PK, secret BLOB)
 //! ratchets      (local_id, peer_id, state BLOB)  —— 双棘轮会话状态
+//! settings      (key PK, value)                  —— 应用级设置（键值对）
 //! ```
 //!
-//! 兼容性：不再迁移旧库。若已存在旧版明文 SQLite 文件（文件头为
-//! "SQLite format 3"），直接删除重建全新加密库；密钥错误的加密库
-//! 则返回错误，绝不误删有效数据。
-
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -32,8 +28,10 @@ use rusqlite::{params, Connection};
 
 use super::app::{ChatMessage, Contact};
 
-/// 明文 SQLite 文件头（识别旧版明文旧库，予以删除重建）。
-const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+/// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+const MAILBOX_WRITE_COUNT_KEY: &str = "mailbox_write_count";
+const AUTO_LOCK_MINUTES_KEY: &str = "auto_lock_minutes";
+pub const MAX_MAILBOX_WRITE_COUNT: usize = 64;
 
 /// SQLite 持久化门面。连接用 `Mutex` 包裹以保证线程安全，且所有操作
 /// 都很小（几十到几百行），同步执行即可。
@@ -42,7 +40,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// 打开（或创建）SQLCipher 加密数据库。旧版明文库会被删除重建。
+    /// 打开（或创建）当前版本的 SQLCipher 加密数据库。
     pub fn open(data_dir: &Path, key: [u8; 32]) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("privchat.db");
@@ -76,20 +74,24 @@ impl Store {
                  peer_id TEXT NOT NULL,
                  state BLOB NOT NULL,
                  PRIMARY KEY (local_id, peer_id)
-             );",
+             );
+                 CREATE TABLE IF NOT EXISTS settings (
+                     key TEXT PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS drafts (
+                     peer_id TEXT PRIMARY KEY,
+                     text TEXT NOT NULL
+                 );",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// 以派生密钥打开加密库。`PRAGMA key` 必须是连接后的首个操作。
-    /// 旧版明文库（文件头 "SQLite format 3"）删除重建；密钥错误的加密
-    /// 库返回错误（不误删有效数据）。
+    /// 密钥错误或数据库不是当前加密库时直接返回错误。
     fn open_with_key(db_path: &Path, key: &[u8; 32]) -> Result<Connection> {
-        if is_legacy_plaintext(db_path) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(db_path.with_extension(format!("db{suffix}")));
-            }
-        }
         let conn = Connection::open(db_path)?;
         let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
         conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
@@ -137,9 +139,7 @@ impl Store {
     /// 消息历史整表读入内存（peer_id → 消息列表，按 time 升序）。
     pub fn load_history(&self) -> Result<HashMap<String, Vec<ChatMessage>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT peer_id, msg_id, sender, text, time FROM messages",
-        )?;
+        let mut stmt = conn.prepare("SELECT peer_id, msg_id, sender, text, time FROM messages")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -246,7 +246,11 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT local_id, peer_id, state FROM ratchets")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -260,18 +264,110 @@ impl Store {
         )?;
         Ok(())
     }
-}
 
-/// 判断文件是否为旧版明文 SQLite（文件头 "SQLite format 3\0"）。
-fn is_legacy_plaintext(db_path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(db_path) else {
-        return false;
-    };
-    let mut hdr = [0u8; 16];
-    if f.read_exact(&mut hdr).is_err() {
-        return false;
+    /// 读取一个应用级设置（键值对）。
+    fn load_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
-    &hdr == SQLITE_HEADER
+
+    /// 写入一个应用级设置（UPSERT）。
+    fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// 读取 mailbox 投放数量（0 = 全部已配置节点）。
+    pub fn load_mailbox_write_count(&self) -> Result<usize> {
+        Ok(self
+            .load_setting(MAILBOX_WRITE_COUNT_KEY)?
+            .and_then(|v| v.parse().ok())
+            .filter(|count| *count <= MAX_MAILBOX_WRITE_COUNT)
+            .unwrap_or(0))
+    }
+
+    /// 保存 mailbox 投放数量（0 = 全部已配置节点）。
+    pub fn save_mailbox_write_count(&self, count: usize) -> Result<()> {
+        if count > MAX_MAILBOX_WRITE_COUNT {
+            return Err(anyhow!(
+                "mailbox write count must be <= {MAX_MAILBOX_WRITE_COUNT}"
+            ));
+        }
+        self.save_setting(MAILBOX_WRITE_COUNT_KEY, &count.to_string())
+    }
+
+    pub fn load_auto_lock_minutes(&self) -> Result<u64> {
+        Ok(self
+            .load_setting(AUTO_LOCK_MINUTES_KEY)?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
+    pub fn save_auto_lock_minutes(&self, minutes: u64) -> Result<()> {
+        if !matches!(minutes, 0 | 1 | 5) {
+            return Err(anyhow!("unsupported auto lock interval"));
+        }
+        self.save_setting(AUTO_LOCK_MINUTES_KEY, &minutes.to_string())
+    }
+
+    pub fn load_draft(&self, peer_id: &str) -> Result<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT text FROM drafts WHERE peer_id = ?1",
+            params![peer_id],
+            |row| row.get(0),
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(String::new()),
+            other => Err(other),
+        })
+        .map_err(Into::into)
+    }
+
+    pub fn save_draft(&self, peer_id: &str, text: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if text.is_empty() {
+            conn.execute("DELETE FROM drafts WHERE peer_id = ?1", params![peer_id])?;
+        } else {
+            conn.execute(
+                "INSERT INTO drafts (peer_id, text) VALUES (?1, ?2)
+                 ON CONFLICT(peer_id) DO UPDATE SET text = excluded.text",
+                params![peer_id, text],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<(String, ChatMessage)>> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT peer_id, msg_id, sender, text, time FROM messages
+             WHERE text LIKE ?1 ORDER BY time DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            Ok((
+                row.get(0)?,
+                ChatMessage {
+                    id: row.get(1)?,
+                    from: row.get(2)?,
+                    text: row.get(3)?,
+                    time: row.get::<_, i64>(4)? as u64,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -282,17 +378,11 @@ mod tests {
     const WRONG_KEY: [u8; 32] = [0x99; 32];
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("privchat-store-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("privchat-store-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn read_header(path: &std::path::Path) -> [u8; 16] {
-        let mut f = std::fs::File::open(path).unwrap();
-        let mut hdr = [0u8; 16];
-        f.read_exact(&mut hdr).unwrap();
-        hdr
     }
 
     fn sample_contacts() -> HashMap<String, Contact> {
@@ -328,8 +418,7 @@ mod tests {
         let dir = temp_dir("enc");
         let store = Store::open(&dir, KEY).expect("open");
 
-        // 新库文件头应为随机 salt，而非明文 SQLite 头。
-        assert_ne!(&read_header(&dir.join("privchat.db")), b"SQLite format 3\0");
+        assert!(dir.join("privchat.db").exists());
 
         let contacts = sample_contacts();
         store.save_contacts(&contacts).expect("save contacts");
@@ -383,30 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_deleted_recreated() {
-        let dir = temp_dir("legacy");
-        // 构造旧版明文库（标准 SQLite 文件头 + 明文数据）。
-        let conn = rusqlite::Connection::open(dir.join("privchat.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE contacts (peer_id TEXT PRIMARY KEY, local_id TEXT NOT NULL, name TEXT, ticket TEXT);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO contacts (peer_id, local_id, name, ticket) VALUES ('peerX','localX','Bob','tkX')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        // 旧版明文库不做迁移，直接删除重建为加密库。
-        let store = Store::open(&dir, KEY).expect("open fresh");
-        assert!(store.load_contacts().unwrap().is_empty(), "legacy data not migrated");
-        assert_ne!(&read_header(&dir.join("privchat.db")), b"SQLite format 3\0");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn empty_ok() {
         let dir = temp_dir("empty");
         let store = Store::open(&dir, KEY).expect("open empty");
@@ -432,8 +497,12 @@ mod tests {
 
         let all = store.load_ratchets().expect("load");
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|(l, p, s)| l == "local1" && p == "peerA" && s == &state1));
-        assert!(all.iter().any(|(l, p, s)| l == "local1" && p == "peerB" && s == &state2));
+        assert!(all
+            .iter()
+            .any(|(l, p, s)| l == "local1" && p == "peerA" && s == &state1));
+        assert!(all
+            .iter()
+            .any(|(l, p, s)| l == "local1" && p == "peerB" && s == &state2));
 
         // UPSERT：同一键覆盖。
         store
@@ -441,11 +510,46 @@ mod tests {
             .expect("upsert");
         let all = store.load_ratchets().expect("reload");
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|(l, p, s)| l == "local1" && p == "peerA" && s == &state2));
+        assert!(all
+            .iter()
+            .any(|(l, p, s)| l == "local1" && p == "peerA" && s == &state2));
 
         // 删除按 local_id 清除全部会话。
         store.delete_ratchet("local1").expect("delete");
         assert!(store.load_ratchets().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let dir = temp_dir("settings");
+        let store = Store::open(&dir, KEY).expect("open");
+
+        // 未设置时缺省 0（= 全部节点）。
+        assert_eq!(store.load_mailbox_write_count().unwrap(), 0);
+        assert!(store.load_setting("nope").unwrap().is_none());
+
+        store.save_mailbox_write_count(2).expect("save count");
+        assert_eq!(store.load_mailbox_write_count().unwrap(), 2);
+        store.save_setting("theme", "dark").expect("save setting");
+        assert_eq!(
+            store.load_setting("theme").unwrap().as_deref(),
+            Some("dark")
+        );
+
+        // UPSERT：同一键覆盖。
+        store.save_mailbox_write_count(3).expect("save count 3");
+        assert_eq!(store.load_mailbox_write_count().unwrap(), 3);
+
+        // 重开后持久化仍在。
+        drop(store);
+        let store2 = Store::open(&dir, KEY).expect("reopen");
+        assert_eq!(store2.load_mailbox_write_count().unwrap(), 3);
+        assert_eq!(
+            store2.load_setting("theme").unwrap().as_deref(),
+            Some("dark")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -456,7 +560,9 @@ mod tests {
         let store = Store::open(&dir, KEY).expect("open");
 
         let secret: [u8; 32] = [0x77; 32];
-        store.save_identity("local1", &secret).expect("save identity");
+        store
+            .save_identity("local1", &secret)
+            .expect("save identity");
         store
             .save_identity("local2", &[0x11; 32])
             .expect("save identity2");

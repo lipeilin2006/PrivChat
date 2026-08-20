@@ -20,24 +20,23 @@
 //! 持久化由 `store`（SQLCipher 全库加密）提供；TODO：FTP 大文件挂载。
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::task::JoinHandle;
 
 use super::crypto;
 use super::mailbox::{MailboxClient, StoredMessage};
 use super::transport::{IncomingEnvelope, Transport};
 
-/// 应用层消息（前后端共享结构）。`id` 为消息 ID（由 (gen,n) 派生），
+/// 应用层消息（前后端共享结构）。`id` 为消息 ID（由棘轮序号和密文派生），
 /// 用于跨直连/mailbox 双通道投递去重。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    /// 旧版历史文件无该字段：缺省时生成空串（升级后历史消息不参与
-    /// 去重，但可正常展示）。配合 `append_history` 去重逻辑使用。
-    #[serde(default)]
     pub id: String,
     pub from: String,
     pub text: String,
@@ -65,27 +64,29 @@ pub struct PlainMsg {
     pub utc_time: u64,
 }
 
-/// 生成消息 ID：`{gen:08x}{n:08x}{发送方身份前8hex}`（24 hex）。
+/// 生成消息 ID：`{gen:08x}{n:08x}{发送方身份前8hex}{密文哈希前16hex}`。
 ///
 /// `(gen, n)` 取自加密后的消息头 —— 发送方的绝对逻辑发送序
 /// （Epoch=DH 刷新代，Seq=本代内链计数）。mailbox 按 msg_id 升序即按
 /// (gen, n) 升序返回，等于棘轮消息顺序；且不含墙钟，不泄露收发时间。
-/// gen 为 u32，杜绝旧版 u8 的 255 次刷新回绕。
+/// gen 为 u32，杜绝刷新回绕。
 ///
-/// **确定性设计**：同一 `(gen, n)` 必然对应同一条逻辑消息。重试/ack 丢失
-/// 时发送侧未提交棘轮（不调用 next()），重发会用相同 `(gen, n)` 重新加密，
-/// 因而得到相同 msg_id —— 接收侧按 msg_id 去重可命中历史，避免对已消费的
-/// 棘轮状态二次解密。
+/// 哈希后缀让公开 mailbox 无法只凭可预测的 `(gen,n)` 提前抢占 ID；接收端
+/// 会根据认证发送方和密文重算 ID。相同密文的重试仍得到相同 ID。
 ///
 /// **跨方向唯一**：双方各从 gen0/n0 开始，仅 `(gen, n)` 会在同一会话的
 /// 收发两侧撞车（我发的第 0 条 == 对方发的第 0 条）。后缀取发送方专属
 /// 身份的前 8 hex 作为方向区分符，且对同一条消息两侧计算一致
-/// （发送侧在此处生成，接收侧直接沿用 wire.msg_id），因此不会像随机尾
-/// 那样破坏重试去重。
+/// （发送侧在此处生成，接收侧会重新校验），因此不会破坏重试去重。
 fn msg_id_for(local_id: &str, blob: &[u8]) -> String {
     let (gen, n) = crypto::Ratchet::header_gen_n(blob).unwrap_or((0, 0));
     let who = local_id.chars().take(8).collect::<String>();
-    format!("{gen:08x}{n:08x}{who}")
+    let digest = Sha256::digest(blob);
+    let hash = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{gen:08x}{n:08x}{who}{hash}")
 }
 
 fn now_ms() -> u64 {
@@ -108,7 +109,10 @@ struct SendCtx {
     store: Arc<super::store::Store>,
     ratchets: Arc<Mutex<HashMap<(String, String), crypto::Ratchet>>>,
     mailbox_peers: Arc<Mutex<Vec<String>>>,
+    /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+    mailbox_write_count: Arc<AtomicUsize>,
     history: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
+    stop: watch::Receiver<bool>,
 }
 
 /// 发送队列中的一条待发任务：携带加密所需的最小载荷与应答通道。
@@ -127,12 +131,15 @@ struct SendJob {
 /// 未送达（无 mailbox 兜底且直连失败），则把队列中剩余消息一并快速
 /// 失败（对端已断连，继续发送只会各自等一个超时）。
 async fn run_send_worker(
-    ctx: SendCtx,
+    mut ctx: SendCtx,
     key: (String, String),
     mut rx: mpsc::UnboundedReceiver<SendJob>,
 ) {
     let (local_id, peer_id) = key;
-    while let Some(job) = rx.recv().await {
+    while let Some(job) = tokio::select! {
+        _ = ctx.stop.changed() => None,
+        job = rx.recv() => job,
+    } {
         let result = ctx.send_one(&local_id, &peer_id, &job).await;
         let failed = result.is_err();
         let _ = job.reply.send(result);
@@ -149,12 +156,7 @@ async fn run_send_worker(
 
 impl SendCtx {
     /// 单条消息的完整发送流程（加密→mailbox→直连→确认提交）。
-    async fn send_one(
-        &self,
-        local_id: &str,
-        peer_id: &str,
-        job: &SendJob,
-    ) -> Result<ChatMessage> {
+    async fn send_one(&self, local_id: &str, peer_id: &str, job: &SendJob) -> Result<ChatMessage> {
         let secret = self.transport.secret_for(local_id).await?;
 
         // 加密只生成密文并在 `pending` 暂存推进，不立即提交会话状态；
@@ -180,29 +182,28 @@ impl SendCtx {
             msg: blob.clone(),
         };
 
-        // 1) mailbox：按顺序尝试存入已配置节点，**任一节点成功即可**——
-        //    节点间通过广播自动网格同步（put→Sync 广播、取回即删→SyncAck），
-        //    其余节点会自动补副本，无需全部写入。全部失败才算 mailbox 不可用。
+        // 1) mailbox：按配置数量投放到多个节点（多副本冗余）。节点间另有
+        //    自动网格同步（put→Sync 广播、取回即删→SyncAck），其余节点会
+        //    自动补副本；多写只是让同一密文直接落在更多节点上，即使个别
+        //    节点永久离线也不丢。任一节点成功即视为 mailbox 可用；全部
+        //    失败才算 mailbox 不可用。
         let peers = self.mailbox_peers.lock().await.clone();
         let mut mailbox_ok = false;
         if !peers.is_empty() {
             let endpoint = self.transport.endpoint_for(local_id).await?;
-            for mb in &peers {
-                match MailboxClient::put(
-                    &endpoint,
-                    mb,
-                    peer_id,
-                    &wire.msg_id,
-                    blob.clone(),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        mailbox_ok = true;
-                        break;
-                    }
-                    Err(e) => eprintln!("[app] mailbox put to {mb} failed: {e}"),
-                }
+            let count = self.mailbox_write_count.load(Ordering::Relaxed);
+            match MailboxClient::put_multi(
+                &endpoint,
+                &peers,
+                peer_id,
+                &wire.msg_id,
+                blob.clone(),
+                count,
+            )
+            .await
+            {
+                Ok(written) => mailbox_ok = written > 0,
+                Err(e) => eprintln!("[app] mailbox PoW failed: {e}"),
             }
         }
 
@@ -271,6 +272,8 @@ pub struct App {
     history: Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>,
     /// 配置的 mailbox 节点 peer_id 列表（空 = 未启用离线消息）。
     mailbox_peers: Arc<Mutex<Vec<String>>>,
+    /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+    mailbox_write_count: Arc<AtomicUsize>,
     /// 待绑定专属身份（已生成邀请但尚未被连接的 local_id）。
     pending: Arc<Mutex<Vec<String>>>,
     /// 双棘轮会话缓存：`(local_id, peer_id) -> Ratchet`，随发送/接收推进并
@@ -285,6 +288,9 @@ pub struct App {
     send_queues: SendQueues,
     /// mailbox 轮询任务是否已启动（运行期动态添加 mailbox 节点时用）。
     mailbox_poll_started: Arc<AtomicBool>,
+    mailbox_poll_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    stop_tx: watch::Sender<bool>,
+    worker_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 /// 持久化的联系人记录：足以在重启后重新建立连接。
@@ -339,10 +345,7 @@ impl App {
             Transport::start_no_relay(store.clone()).await?
         };
 
-        let mut contacts = store.load_contacts()?;
-        // 旧版联系人无 local_id（主身份时代遗留）：无法映射到专属身份，
-        // 本端已无主身份，跳过（用户可重新添加）。
-        contacts.retain(|_, c| !c.local_id.is_empty());
+        let contacts = store.load_contacts()?;
         let contacts = Arc::new(Mutex::new(contacts));
         let history = Arc::new(Mutex::new(store.load_history()?));
 
@@ -351,11 +354,7 @@ impl App {
         {
             let mut pend = pending.lock().await;
             for id in transport.local_ids().await {
-                let used = contacts
-                    .lock()
-                    .await
-                    .values()
-                    .any(|c| c.local_id == id);
+                let used = contacts.lock().await.values().any(|c| c.local_id == id);
                 if !used {
                     pend.push(id);
                 }
@@ -374,6 +373,8 @@ impl App {
         // （relay）启动轮询；no-relay 集成测试不启用，避免后台任务持有
         // 端口阻塞重启。
         let mailbox_peers = Arc::new(Mutex::new(store.load_mailbox_peers()?));
+        // 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+        let mailbox_write_count = Arc::new(AtomicUsize::new(store.load_mailbox_write_count()?));
 
         // 双棘轮会话：从磁盘恢复（需要各专属身份私钥还原 root₀ 与链状态）。
         let identities = store.load_identities()?;
@@ -385,13 +386,21 @@ impl App {
             let Ok(secret) = iroh::SecretKey::try_from(secret_bytes.as_slice()) else {
                 continue;
             };
-            if let Ok(r) = crypto::Ratchet::from_bytes(&secret, &peer_id, &state) {
-                ratchet_map.insert((local_id, peer_id), r);
+            match crypto::Ratchet::from_bytes(&secret, &peer_id, &state) {
+                Ok(r) => {
+                    ratchet_map.insert((local_id, peer_id), r);
+                }
+                Err(e) => {
+                    eprintln!("[app] discarded incompatible ratchet state for {local_id}: {e}");
+                }
             }
         }
         let ratchets = Arc::new(Mutex::new(ratchet_map));
         let send_queues = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_poll_started = Arc::new(AtomicBool::new(false));
+        let mailbox_poll_task = Arc::new(Mutex::new(None));
+        let (stop_tx, _) = watch::channel(false);
+        let worker_tasks = Arc::new(Mutex::new(Vec::new()));
 
         let app = Self {
             transport,
@@ -399,15 +408,20 @@ impl App {
             contacts,
             history,
             mailbox_peers,
+            mailbox_write_count,
             pending,
             ratchets,
             send_queues,
             mailbox_poll_started,
+            mailbox_poll_task,
+            stop_tx,
+            worker_tasks,
         };
 
         if use_relay && !app.mailbox_peers.lock().await.is_empty() {
             app.mailbox_poll_started.store(true, Ordering::Relaxed);
-            app.spawn_mailbox_poll(app.transport.incoming_sender());
+            app.start_mailbox_poll(app.transport.incoming_sender())
+                .await;
         }
 
         Ok((app, rx))
@@ -436,6 +450,40 @@ impl App {
         self.mailbox_peers.lock().await.clone()
     }
 
+    pub async fn ping_mailbox(&self, peer_id: &str) -> Result<u64> {
+        let local_id = self
+            .transport
+            .local_ids()
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("identity recovery failed"))?;
+        let endpoint = self.transport.endpoint_for(&local_id).await?;
+        let started = std::time::Instant::now();
+        super::mailbox::MailboxClient::ping(&endpoint, peer_id).await?;
+        Ok(started.elapsed().as_millis() as u64)
+    }
+
+    /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
+    pub async fn get_mailbox_write_count(&self) -> usize {
+        self.mailbox_write_count.load(Ordering::Relaxed)
+    }
+
+    pub fn get_auto_lock_minutes(&self) -> Result<u64> {
+        self.store.load_auto_lock_minutes()
+    }
+
+    pub fn set_auto_lock_minutes(&self, minutes: u64) -> Result<()> {
+        self.store.save_auto_lock_minutes(minutes)
+    }
+
+    /// 设置每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点），持久化。
+    pub async fn set_mailbox_write_count(&self, count: usize) -> Result<()> {
+        self.store.save_mailbox_write_count(count)?;
+        self.mailbox_write_count.store(count, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// 追加一个 mailbox 节点（去重后持久化）。
     ///
     /// 若此前尚未启动 mailbox 轮询（例如启动时未配置任何节点），则在首个
@@ -450,7 +498,8 @@ impl App {
         drop(peers);
         self.persist_mailbox_peers(&snapshot)?;
         if !self.mailbox_poll_started.swap(true, Ordering::Relaxed) {
-            self.spawn_mailbox_poll(self.transport.incoming_sender());
+            self.start_mailbox_poll(self.transport.incoming_sender())
+                .await;
         }
         Ok(())
     }
@@ -473,24 +522,52 @@ impl App {
     /// 后台轮询任务：每 20 秒从 mailbox 拉取全部联系人的待收密文，
     /// 解密后注入入站通道（走与直连相同的 handle_incoming/前端 emit
     /// 流程），成功后 ACK。
-    fn spawn_mailbox_poll(&self, tx: mpsc::UnboundedSender<IncomingEnvelope>) {
+    async fn start_mailbox_poll(&self, tx: mpsc::UnboundedSender<IncomingEnvelope>) {
+        let mut task = self.mailbox_poll_task.lock().await;
+        if task.is_some() {
+            return;
+        }
         let app = PollApp {
             transport: self.transport.clone(),
             mailbox_peers: self.mailbox_peers.clone(),
             history: self.history.clone(),
             contacts: self.contacts.clone(),
         };
-        tokio::spawn(async move {
+        let mut stop = self.stop_tx.subscribe();
+        *task = Some(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(20);
             loop {
-                app.poll_mailbox_once(tx.clone()).await;
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = app.poll_mailbox_once(tx.clone()) => {}
+                }
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
             }
-        });
+        }));
     }
 
-    /// 主动关闭全部底层连接（重启测试/退出前调用）。
-    #[allow(dead_code)] // 供前端退出流程调用
+    /// 停止轮询、发送队列、入站网络和所有身份端点。
+    pub async fn shutdown(&self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(task) = self.mailbox_poll_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.mailbox_poll_started.store(false, Ordering::Relaxed);
+        self.send_queues.lock().await.clear();
+        let tasks = std::mem::take(&mut *self.worker_tasks.lock().await);
+        for task in tasks {
+            let _ = task.await;
+        }
+        self.ratchets.lock().await.clear();
+        self.transport.close().await;
+    }
+
+    /// 主动关闭全部底层连接（重启测试用）。
+    #[cfg(test)]
     pub async fn close(&self) {
         self.transport.close().await;
     }
@@ -523,9 +600,27 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub fn load_draft(&self, peer_id: &str) -> Result<String> {
+        self.store.load_draft(peer_id)
+    }
+
+    pub fn save_draft(&self, peer_id: &str, text: &str) -> Result<()> {
+        self.store.save_draft(peer_id, text)
+    }
+
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<(String, ChatMessage)>> {
+        self.store.search_messages(query, limit)
+    }
+
     /// 删除联系人：移除联系人表、专属身份与历史会话。
     pub async fn delete_contact(&self, peer_id: &str) -> Result<()> {
-        let local_id = self.contacts.lock().await.get(peer_id).cloned().map(|c| c.local_id);
+        let local_id = self
+            .contacts
+            .lock()
+            .await
+            .get(peer_id)
+            .cloned()
+            .map(|c| c.local_id);
         self.contacts.lock().await.remove(peer_id);
         self.history.lock().await.remove(peer_id);
         if let Some(local_id) = local_id {
@@ -537,12 +632,17 @@ impl App {
                 .await
                 .remove(&(local_id.clone(), peer_id.to_string()));
             // 删除专属身份与会话：会话密钥（棘轮）一并销毁，实现会话级前向保密。
-            self.ratchets.lock().await.remove(&(local_id.clone(), peer_id.to_string()));
+            self.ratchets
+                .lock()
+                .await
+                .remove(&(local_id.clone(), peer_id.to_string()));
             if let Err(e) = self.store.delete_ratchet(&local_id) {
                 eprintln!("[app] failed to delete ratchet for {local_id}: {e}");
             }
             self.transport.drop_identity(&local_id).await;
+            self.pending.lock().await.retain(|id| id != &local_id);
         }
+        self.store.save_draft(peer_id, "")?;
         self.persist_contacts().await;
         self.persist_history().await;
         Ok(())
@@ -574,11 +674,7 @@ impl App {
     /// 本端为对方生成/复用一个新的专属身份作为本地身份；若已有待绑定邀请
     /// 身份（`self_ticket` 新建）则绑定给该联系人，否则新建。
     /// **防冲突**：选中的本地身份必须未被任何联系人占用，否则跳过重选。
-    pub async fn connect_peer(
-        &self,
-        invite: &str,
-        name: Option<String>,
-    ) -> Result<String> {
+    pub async fn connect_peer(&self, invite: &str, name: Option<String>) -> Result<String> {
         // 先解析对方身份（同时验证邀请串合法性）。
         let _remote = self.transport.parse_peer_id(invite)?;
 
@@ -679,12 +775,15 @@ impl App {
                     store: self.store.clone(),
                     ratchets: self.ratchets.clone(),
                     mailbox_peers: self.mailbox_peers.clone(),
+                    mailbox_write_count: self.mailbox_write_count.clone(),
                     history: self.history.clone(),
+                    stop: self.stop_tx.subscribe(),
                 };
                 let key_for_worker = key.clone();
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     run_send_worker(ctx, key_for_worker, rx).await;
                 });
+                self.worker_tasks.lock().await.push(task);
                 queues.insert(key.clone(), tx.clone());
                 tx
             }
@@ -722,10 +821,7 @@ impl App {
         {
             let contacts = self.contacts.lock().await;
             // 1) 该专属身份已被另一个对端占用 -> 拒绝。
-            if let Some((owner, _)) = contacts
-                .iter()
-                .find(|(_, c)| c.local_id == local_id)
-            {
+            if let Some((owner, _)) = contacts.iter().find(|(_, c)| c.local_id == local_id) {
                 if owner != &sender {
                     eprintln!(
                         "[app] identity {local_id} already bound to {owner}, rejecting message from {sender}"
@@ -753,6 +849,17 @@ impl App {
             .get(&sender)
             .is_some_and(|conv| conv.iter().any(|m| m.id == wire.msg_id))
         {
+            return Ok(None);
+        }
+
+        // msg_id 绑定认证发送方和完整密文，拒绝 mailbox 上用可预测
+        // (gen,n) 抢占的伪造元数据。
+        let expected_id = msg_id_for(&sender, &wire.msg);
+        if wire.msg_id != expected_id {
+            eprintln!(
+                "[app] rejecting message with invalid msg_id {}",
+                wire.msg_id
+            );
             return Ok(None);
         }
 
@@ -832,13 +939,14 @@ impl PollApp {
             };
 
             for peer in &peers {
-                let messages: Vec<StoredMessage> = match MailboxClient::fetch(&endpoint, peer, &local_id).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("[mailbox] fetch from {peer} failed: {e}");
-                        continue;
-                    }
-                };
+                let messages: Vec<StoredMessage> =
+                    match MailboxClient::fetch(&endpoint, peer, &local_id).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[mailbox] fetch from {peer} failed: {e}");
+                            continue;
+                        }
+                    };
                 if messages.is_empty() {
                     continue;
                 }

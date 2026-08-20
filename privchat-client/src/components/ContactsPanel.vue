@@ -2,8 +2,10 @@
 import { computed, ref } from "vue";
 import { useQuasar } from "quasar";
 import { avatarColor, initials } from "../utils/avatar";
+import { useI18n } from "../i18n";
 
 const $q = useQuasar();
+const { t } = useI18n();
 
 const props = defineProps({
   conversations: { type: Array, required: true },
@@ -11,7 +13,7 @@ const props = defineProps({
   connecting: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["select", "add", "settings", "delete"]);
+const emit = defineEmits(["select", "add", "settings", "delete", "search-messages"]);
 
 const search = ref("");
 const contextConv = ref(null);
@@ -25,8 +27,8 @@ function openContext(conv) {
 async function confirmDelete() {
   if (!contextConv.value) return;
   const { value: ok } = await $q.dialog({
-    title: "Delete contact?",
-    message: `Remove "${contextConv.value.name}" and its chat history?`,
+    title: t("contacts.deleteTitle"),
+    message: t("contacts.deleteMessage", { name: contextConv.value.name }),
     cancel: true,
     persistent: true,
     color: "negative",
@@ -49,6 +51,11 @@ function fmtTime(ms) {
     minute: "2-digit",
   });
 }
+
+function submitSearch() {
+  const query = search.value.trim();
+  if (query) emit("search-messages", query);
+}
 </script>
 
 <template>
@@ -62,10 +69,10 @@ function fmtTime(ms) {
             dense
             color="grey-4"
             icon="menu"
-            title="Settings"
+            :title="t('contacts.settings')"
             @click="emit('settings')"
           />
-          <div class="text-subtitle1 text-weight-medium q-ml-sm">Messages</div>
+          <div class="text-subtitle1 text-weight-medium q-ml-sm">{{ t("contacts.messages") }}</div>
         </div>
         <q-btn
           flat
@@ -73,7 +80,7 @@ function fmtTime(ms) {
           dense
           color="grey-4"
           icon="person_add"
-          title="Add contact"
+          :title="t('contacts.add')"
           :disable="connecting"
           @click="emit('add')"
         />
@@ -87,13 +94,14 @@ function fmtTime(ms) {
           outlined
           color="primary"
           class="col"
-          placeholder="Search chats"
+          :placeholder="t('contacts.search')"
+          @keyup.enter="submitSearch"
         >
           <template #prepend>
             <q-icon name="search" size="18px" color="grey-5" />
           </template>
           <template v-if="search" #append>
-            <q-icon name="cancel" size="16px" color="grey-5" class="cursor-pointer" @click="search = ''" />
+            <q-icon name="cancel" size="16px" color="grey-5" class="cursor-pointer q-mr-sm" @click="search = ''" />
           </template>
         </q-input>
       </div>
@@ -168,14 +176,14 @@ function fmtTime(ms) {
           <div v-else class="empty-state text-center q-py-lg">
             <q-icon name="forum" size="48px" color="grey-7" />
             <div class="text-grey-6 q-mt-sm">
-              {{ search ? "No matches" : "No conversations yet" }}
+              {{ search ? t("contacts.noMatches") : t("contacts.empty") }}
             </div>
             <q-btn
               v-if="!search"
               unelevated
               color="primary"
               icon="person_add"
-              label="Add contact"
+              :label="t('contacts.add')"
               class="q-mt-md"
               :disable="connecting"
               @click="emit('add')"
@@ -195,14 +203,14 @@ function fmtTime(ms) {
           <q-item-section avatar>
             <q-icon name="chat" size="18px" color="grey-5" />
           </q-item-section>
-          <q-item-section>Open chat</q-item-section>
+          <q-item-section>{{ t("contacts.open") }}</q-item-section>
         </q-item>
         <q-separator />
         <q-item clickable v-ripple class="text-negative" @click="confirmDelete">
           <q-item-section avatar>
             <q-icon name="person_remove" size="18px" color="negative" />
           </q-item-section>
-          <q-item-section>Delete contact</q-item-section>
+          <q-item-section>{{ t("contacts.delete") }}</q-item-section>
         </q-item>
       </q-list>
     </q-menu>

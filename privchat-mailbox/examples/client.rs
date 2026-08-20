@@ -5,7 +5,7 @@
 //!   cargo run --example client -- <mailbox_peer_id> fetch <recipient>
 
 use anyhow::{anyhow, Result};
-use privchat_mailbox::{MailboxRequest, find_pow, make_endpoint, send_request};
+use privchat_mailbox::{find_pow, make_endpoint, send_request, MailboxRequest};
 
 #[tokio::main]
 async fn main() -> Result<()> {

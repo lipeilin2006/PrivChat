@@ -1,9 +1,12 @@
 <script setup>
 import { computed, nextTick, ref, watch } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { useQuasar } from "quasar";
 import { avatarColor, initials } from "../utils/avatar";
+import { useI18n } from "../i18n";
 
 const $q = useQuasar();
+const { t } = useI18n();
 
 const props = defineProps({
   conversation: { type: Object, default: null },
@@ -28,9 +31,9 @@ function onScroll(info) {
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
-    $q.notify({ type: "positive", message: "Message copied", position: "bottom" });
+      $q.notify({ type: "positive", message: t("chat.copied"), position: "bottom" });
   } catch (e) {
-    $q.notify({ type: "negative", message: `Copy failed: ${e}`, position: "bottom" });
+      $q.notify({ type: "negative", message: t("chat.copyFailed", { error: e }), position: "bottom" });
   }
 }
 
@@ -58,6 +61,22 @@ const grouped = computed(() => {
 });
 
 watch(
+  () => props.conversation?.nodeId,
+  async (peerId) => {
+    draft.value = peerId ? await invoke("get_draft", { peerId }).catch(() => "") : "";
+  },
+  { immediate: true }
+);
+
+watch(
+  draft,
+  (text) => {
+    const peerId = props.conversation?.nodeId;
+    if (peerId) invoke("save_draft", { peerId, text }).catch(() => {});
+  }
+);
+
+watch(
   () => props.messages.length,
   async () => {
     await nextTick();
@@ -83,8 +102,8 @@ function fmtDay(ms) {
     a.getFullYear() === b.getFullYear() &&
     a.getMonth() === b.getMonth() &&
     a.getDate() === b.getDate();
-  if (same(d, today)) return "Today";
-  if (same(d, yesterday)) return "Yesterday";
+  if (same(d, today)) return t("chat.today");
+  if (same(d, yesterday)) return t("chat.yesterday");
   return d.toLocaleDateString([], {
     month: "long",
     day: "numeric",
@@ -185,9 +204,15 @@ function resend(msg) {
                     <q-icon v-else name="done_all" size="14px" />
                   </template>
                 </div>
-                <div v-if="g.msg.status === 'failed'" class="bubble-retry">
-                  resend
-                </div>
+                  <div v-if="g.msg.status === 'failed'" class="bubble-retry">
+                   {{ g.msg.error || t("chat.resend") }} · {{ t("chat.resend") }}
+                  </div>
+                  <div v-else-if="g.msg.status === 'resending'" class="bubble-retry">
+                   {{ t("chat.resending") }}
+                  </div>
+                  <div v-else-if="g.msg.status === 'cancelled'" class="bubble-retry">
+                   {{ t("chat.cancelled") }}
+                  </div>
               </div>
             </div>
           </template>
@@ -211,7 +236,7 @@ function resend(msg) {
           <q-item-section avatar>
             <q-icon name="content_copy" size="18px" color="grey-5" />
           </q-item-section>
-          <q-item-section>Copy message</q-item-section>
+          <q-item-section>{{ t("chat.copy") }}</q-item-section>
         </q-item>
       </q-list>
     </q-menu>
@@ -223,7 +248,7 @@ function resend(msg) {
         rounded
         filled
         class="composer-input"
-        placeholder="Message"
+         :placeholder="t('chat.message')"
         autogrow
         :maxlength="4000"
         @keyup.enter="submit"
@@ -248,7 +273,7 @@ function resend(msg) {
       </div>
       <div class="text-h6 text-grey-5 q-mt-md">PrivChat</div>
       <div class="text-grey-6 q-mt-xs">
-        Encrypted · Peer to peer
+         {{ t("chat.encrypted") }}
       </div>
     </div>
   </div>

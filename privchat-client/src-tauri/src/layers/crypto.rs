@@ -10,13 +10,16 @@
 //!   公钥字典序标 `low`/`high`：公钥小者的发送链 = low 方向链，大者的发送链
 //!   = high 方向链。因此双方各自算出同一对 (send_ck, recv_ck)，并发首发
 //!   不会互相打乱对方链。
-//! - **gen 与收敛性 DH 刷新**：每次消息头携带当前 gen 与本端本代 eph 公钥。
-//!   当本端**已在本代发送过**（send_n>0）且**已收到对方本代 eph** 时，下次
-//!   发送前刷新：`root_{g+1} = KDF_RK(root_g, DH(my_eph_g, their_eph_g))`。
+//! - **gen 与收敛性 DH 刷新**：每次消息头携带当前 gen、本端本代 eph 公钥
+//!   （`dh_pub`）与刷新所用的**上一代 eph 公钥**（`prev_eph`）。当本端
+//!   **已在本代发送过**（send_n>0）且**已收到对方本代 eph** 时，下次发送前
+//!   刷新：`root_{g+1} = KDF_RK(root_g, DH(my_eph_g, their_eph_g))`。
 //!   X25519 对称性（DH(a,b)==DH(b,a)）保证双方得到同一新 root。首次发送
 //!   时必须先发本代消息 announce 自己的 eph（send_n==0 不刷新），否则对方
 //!   无法还原新 root。接收方若发现对方领先一代（`header.gen == gen+1`），
-//!   用本代 eph 对收敛刷新后解密。
+//!   用**消息头里的 `prev_eph`**（即对方刷新所用的旧 eph 公钥）配合本端
+//!   本代 eph 私钥做收敛刷新——即使从未收到对方旧代消息（离线/乱序漏收）
+//!   也能还原同一 root，这正是 header 冗余 `prev_eph` 的意义。
 //! - **滑动窗口（skipped 池）**：同代乱序 / 跨代迟到的消息密钥暂存于
 //!   `(gen, n) -> mk` 池，取用后即销毁；窗口 `MAX_SKIP` 限制单次前跳，
 //!   池容量 `SKIPPED_MAX` 防 DoS。
@@ -25,16 +28,17 @@
 //!
 //! 消息 blob 格式（存 mailbox / 走 wire 的 `msg`）：
 //! ```text
-//! [0..4] magic "PRR2" | [4] version=2 | [5..9] gen u32LE
+//! [0..4] magic "PRR2" | [4] version=4 | [5..9] gen u32LE
 //! [9..41] dh_pub (32) | [41..45] n u32LE | [45..49] pn u32LE
-//! [49..61] nonce (12) | [61..] ChaCha20-Poly1305 ciphertext
+//! [49..81] prev_eph (32) | [81..93] nonce (12) | [93..] ChaCha20-Poly1305 ciphertext
 //! ```
-//! 固定前缀 61 字节（gen 为 u32，杜绝刷新回绕）。mailbox 只接触密文。
+//! 固定前缀 93 字节（gen 为 u32，杜绝刷新回绕），完整头作为 AEAD AAD
+//! 认证。mailbox 只接触密文。
 
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
@@ -45,9 +49,9 @@ use x25519_dalek::StaticSecret;
 /// wire 消息头魔数。
 const MAGIC: &[u8; 4] = b"PRR2";
 /// 状态 / 消息版本。
-const VERSION: u8 = 2;
+const VERSION: u8 = 4;
 /// 消息固定前缀长度。
-const HEADER_LEN: usize = 61;
+const HEADER_LEN: usize = 93;
 /// 单次前跳 / 跨代快进的最大窗口。
 const MAX_SKIP: u32 = 200;
 /// skipped 池容量上限（防 DoS）。
@@ -77,6 +81,10 @@ pub struct Ratchet {
     our_eph_pub: Option<[u8; 32]>,
     /// 对端当前代临时公钥（gen, pub）。
     their_eph: Option<(u32, [u8; 32])>,
+    /// 本端刷新上一代所用的旧 eph 公钥（gen g 刷新到 g+1 后固定为本代携带值）。
+    /// 随每个消息头冗余携带：接收方收敛刷新时用它替代 `their_eph`，即使漏收
+    /// 旧代消息也能还原同一 root。
+    prev_eph: [u8; 32],
     /// 发送链 / 发送计数。
     send_ck: [u8; 32],
     send_n: u32,
@@ -94,10 +102,12 @@ pub struct Ratchet {
 
 /// 解析后的消息头。
 struct Header {
+    len: usize,
     gen: u32,
     dh_pub: [u8; 32],
     n: u32,
     pn: u32,
+    prev_eph: [u8; 32],
     nonce: [u8; 12],
 }
 
@@ -119,6 +129,7 @@ impl Ratchet {
             our_eph_priv: None,
             our_eph_pub: None,
             their_eph: None,
+            prev_eph: [0u8; 32],
             send_ck,
             send_n: 0,
             recv_ck,
@@ -186,6 +197,7 @@ impl Ratchet {
                 p.prev_send_n = self.prev_send_n;
                 p.our_eph_priv = self.our_eph_priv;
                 p.our_eph_pub = self.our_eph_pub;
+                p.prev_eph = self.prev_eph;
             }
             self.pending = Some(p);
         }
@@ -195,7 +207,7 @@ impl Ratchet {
     /// 是否为本层可识别的密文格式（magic + version）。用于 mailbox 轮询
     /// 在不消耗棘轮状态的前提下做格式预检。
     pub fn has_valid_prefix(blob: &[u8]) -> bool {
-        blob.len() >= HEADER_LEN && &blob[..4] == MAGIC && blob[4] == VERSION
+        parse_header(blob).is_ok()
     }
 
     /// 读取消息头的 `(gen, n)` —— 发送方的绝对逻辑发送序（Epoch, Seq）。
@@ -207,12 +219,12 @@ impl Ratchet {
 
     /// 序列化会话状态（不含长期私钥与对端标识，二者由 DB 键提供）。
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(232 + self.skipped.len() * 40);
+        let mut out = Vec::with_capacity(264 + self.skipped.len() * 40);
         out.push(VERSION);
         out.extend_from_slice(&self.gen.to_le_bytes());
         out.extend_from_slice(&self.root);
-        let flags = u8::from(self.our_eph_priv.is_some())
-            | (u8::from(self.their_eph.is_some()) << 1);
+        let flags =
+            u8::from(self.our_eph_priv.is_some()) | (u8::from(self.their_eph.is_some()) << 1);
         out.push(flags);
         if let Some(priv_bytes) = self.our_eph_priv {
             out.extend_from_slice(&priv_bytes);
@@ -222,6 +234,7 @@ impl Ratchet {
             out.extend_from_slice(&g.to_le_bytes());
             out.extend_from_slice(&pub_bytes);
         }
+        out.extend_from_slice(&self.prev_eph);
         out.extend_from_slice(&self.send_ck);
         out.extend_from_slice(&self.send_n.to_le_bytes());
         out.extend_from_slice(&self.recv_ck);
@@ -248,7 +261,10 @@ impl Ratchet {
         let has_eph = flags & 1 == 1;
         let has_their = flags & 2 == 2;
         let (our_eph_priv, our_eph_pub) = if has_eph {
-            (Some(read_fixed::<32>(bytes, &mut pos)?), Some(read_fixed::<32>(bytes, &mut pos)?))
+            (
+                Some(read_fixed::<32>(bytes, &mut pos)?),
+                Some(read_fixed::<32>(bytes, &mut pos)?),
+            )
         } else {
             (None, None)
         };
@@ -258,6 +274,7 @@ impl Ratchet {
         } else {
             None
         };
+        let prev_eph = read_fixed::<32>(bytes, &mut pos)?;
         let send_ck = read_fixed::<32>(bytes, &mut pos)?;
         let send_n = read_u32(bytes, &mut pos)?;
         let recv_ck = read_fixed::<32>(bytes, &mut pos)?;
@@ -289,6 +306,7 @@ impl Ratchet {
             our_eph_priv,
             our_eph_pub,
             their_eph,
+            prev_eph,
             send_ck,
             send_n,
             recv_ck,
@@ -319,6 +337,9 @@ impl Ratchet {
                 self.send_n = 0;
                 self.recv_ck = recv_ck;
                 self.recv_n = 0;
+                // 刷新前的旧 eph 公钥固定为本代消息头携带的 prev_eph：
+                // 对方即使从未收到本端旧代消息，也能凭它还原同一 root。
+                self.prev_eph = *self.our_eph_pub.as_ref().unwrap();
                 let (priv_bytes, pub_bytes) = new_eph();
                 self.our_eph_priv = Some(priv_bytes);
                 self.our_eph_pub = Some(pub_bytes);
@@ -332,19 +353,27 @@ impl Ratchet {
 
         let mut nonce = [0u8; 12];
         rand_core::OsRng.fill_bytes(&mut nonce);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
-        let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce), plaintext)
-            .map_err(|e| anyhow!("encrypt failed: {e}"))?;
-
-        let mut out = Vec::with_capacity(HEADER_LEN + ct.len());
+        // 完整明文头作为 AEAD AAD，防止篡改 dh_pub/prev_eph/gen/n 等字段
+        // 污染棘轮状态。先组头，再加密正文并把 tag 追加在密文末尾。
+        let mut out = Vec::with_capacity(HEADER_LEN + plaintext.len() + 16);
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
         out.extend_from_slice(&self.gen.to_le_bytes());
         out.extend_from_slice(self.our_eph_pub.as_ref().unwrap());
         out.extend_from_slice(&n.to_le_bytes());
         out.extend_from_slice(&self.prev_send_n.to_le_bytes());
+        out.extend_from_slice(&self.prev_eph);
         out.extend_from_slice(&nonce);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&mk));
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &out,
+                },
+            )
+            .map_err(|e| anyhow!("encrypt failed: {e}"))?;
         out.extend_from_slice(&ct);
         Ok(out)
     }
@@ -364,12 +393,9 @@ impl Ratchet {
             let our_priv = self
                 .our_eph_priv
                 .ok_or_else(|| anyhow!("no own eph for recv refresh"))?;
-            let (their_gen, their_pub) = self
-                .their_eph
-                .ok_or_else(|| anyhow!("no their eph for recv refresh"))?;
-            if their_gen != self.gen {
-                return Err(anyhow!("stale their eph gen {their_gen}, local {}", self.gen));
-            }
+            // 用消息头冗余的 prev_eph（对方刷新所用的旧 eph 公钥）做 DH，
+            // 而不是本地记录的 their_eph：即使漏收对方旧代消息也能还原 root。
+            // X25519 对称性保证与发送方 DH(my_eph_old, their_eph) 相同。
             // 快进旧接收链到 header.pn，把迟到消息的密钥存入 skipped 池。
             if hdr.pn > self.recv_n {
                 if hdr.pn - self.recv_n > MAX_SKIP {
@@ -382,7 +408,7 @@ impl Ratchet {
                     insert_skipped(&mut self.skipped, (self.gen, i), mk)?;
                 }
             }
-            let dh = x25519_shared(&our_priv, &their_pub);
+            let dh = x25519_shared(&our_priv, &hdr.prev_eph);
             let new_root = kdf_rk(&self.root, &dh);
             let (send_ck, recv_ck) = derive_chains(&new_root, &self.own_pub, &self.peer_pub);
             self.prev_send_n = self.send_n;
@@ -392,6 +418,8 @@ impl Ratchet {
             self.send_n = 0;
             self.recv_ck = recv_ck;
             self.recv_n = 0;
+            // 本端刷新前的旧 eph 公钥固定为本代携带值，供对方收敛刷新。
+            self.prev_eph = *self.our_eph_pub.as_ref().unwrap();
             let (priv_bytes, pub_bytes) = new_eph();
             self.our_eph_priv = Some(priv_bytes);
             self.our_eph_pub = Some(pub_bytes);
@@ -429,14 +457,14 @@ impl Ratchet {
                     .remove(&(self.gen, hdr.n))
                     .ok_or_else(|| anyhow!("message {} too old / already consumed", hdr.n))?
             };
-            decrypt_aead(&mk, &hdr.nonce, &blob[HEADER_LEN..])
+            decrypt_aead(&mk, &hdr, blob)
         } else {
             // 跨代迟到（hdr.gen < self.gen）：只能从 skipped 池取用。
             let mk = self
                 .skipped
                 .remove(&(hdr.gen, hdr.n))
                 .ok_or_else(|| anyhow!("message from stale gen {} too old", hdr.gen))?;
-            decrypt_aead(&mk, &hdr.nonce, &blob[HEADER_LEN..])
+            decrypt_aead(&mk, &hdr, blob)
         }
     }
 }
@@ -453,6 +481,7 @@ impl Clone for Ratchet {
             our_eph_priv: self.our_eph_priv,
             our_eph_pub: self.our_eph_pub,
             their_eph: self.their_eph,
+            prev_eph: self.prev_eph,
             send_ck: self.send_ck,
             send_n: self.send_n,
             recv_ck: self.recv_ck,
@@ -512,11 +541,7 @@ fn kdf_ck(ck: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// 从 root 派生双链：公钥小者的发送链 = low 方向链，大者 = high 方向链。
-fn derive_chains(
-    root: &[u8; 32],
-    own_pub: &[u8; 32],
-    peer_pub: &[u8; 32],
-) -> ([u8; 32], [u8; 32]) {
+fn derive_chains(root: &[u8; 32], own_pub: &[u8; 32], peer_pub: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let hk = Hkdf::<Sha256>::new(None, root);
     let mut low = [0u8; 32];
     let mut high = [0u8; 32];
@@ -538,10 +563,16 @@ fn x25519_shared(priv_bytes: &[u8; 32], pub_bytes: &[u8; 32]) -> [u8; 32] {
     *secret.diffie_hellman(&public).as_bytes()
 }
 
-fn decrypt_aead(mk: &[u8; 32], nonce: &[u8; 12], ct: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_aead(mk: &[u8; 32], header: &Header, blob: &[u8]) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(mk));
     cipher
-        .decrypt(Nonce::from_slice(nonce), ct)
+        .decrypt(
+            Nonce::from_slice(&header.nonce),
+            Payload {
+                msg: &blob[header.len..],
+                aad: &blob[..header.len],
+            },
+        )
         .map_err(|e| anyhow!("decrypt failed: {e}"))
 }
 
@@ -561,21 +592,30 @@ fn insert_skipped(
 
 /// 解析消息头。只读，不消耗任何状态。
 fn parse_header(blob: &[u8]) -> Result<Header> {
+    if blob.len() < 5 || &blob[..4] != MAGIC {
+        return Err(anyhow!("bad magic/version"));
+    }
+    let version = blob[4];
+    if version != VERSION {
+        return Err(anyhow!("bad magic/version"));
+    }
+    let len = HEADER_LEN;
     if blob.len() < HEADER_LEN {
         return Err(anyhow!("blob too short"));
     }
-    if &blob[..4] != MAGIC || blob[4] != VERSION {
-        return Err(anyhow!("bad magic/version"));
-    }
     let mut dh_pub = [0u8; 32];
     dh_pub.copy_from_slice(&blob[9..41]);
+    let mut prev_eph = [0u8; 32];
     let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&blob[49..61]);
+    prev_eph.copy_from_slice(&blob[49..81]);
+    nonce.copy_from_slice(&blob[81..93]);
     Ok(Header {
+        len,
         gen: u32::from_le_bytes(blob[5..9].try_into().unwrap()),
         dh_pub,
         n: u32::from_le_bytes(blob[41..45].try_into().unwrap()),
         pn: u32::from_le_bytes(blob[45..49].try_into().unwrap()),
+        prev_eph,
         nonce,
     })
 }
@@ -612,9 +652,7 @@ fn hex_val(b: u8) -> Result<u8> {
 }
 
 fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
-    let b = *bytes
-        .get(*pos)
-        .ok_or_else(|| anyhow!("truncated state"))?;
+    let b = *bytes.get(*pos).ok_or_else(|| anyhow!("truncated state"))?;
     *pos += 1;
     Ok(b)
 }

@@ -2,8 +2,10 @@
 import { computed, ref } from "vue";
 import { useQuasar } from "quasar";
 import { avatarColor, initials } from "../utils/avatar";
+import { useI18n } from "../i18n";
 
 const $q = useQuasar();
+const { t } = useI18n();
 
 const props = defineProps({
   conversation: { type: Object, default: null },
@@ -41,6 +43,7 @@ const shortId = computed(() => {
   if (!id) return "";
   return id.slice(0, 16) + "…" + id.slice(-8);
 });
+
 </script>
 
 <template>
@@ -57,7 +60,7 @@ const shortId = computed(() => {
           class="q-mr-sm"
           @click="emit('close')"
         />
-        <span class="text-subtitle2">Chat info</span>
+        <span class="text-subtitle2">{{ t("info.title") }}</span>
       </div>
       <q-btn v-if="!mobile" flat round dense icon="close" color="grey-5" @click="emit('close')" />
     </div>
@@ -86,8 +89,8 @@ const shortId = computed(() => {
               @keyup.esc="cancelEdit"
             />
             <div class="row justify-center q-gutter-sm q-mt-sm">
-              <q-btn flat dense no-caps size="sm" color="grey-5" label="Cancel" @click="cancelEdit" />
-              <q-btn flat dense no-caps size="sm" color="primary" label="Save" @click="saveName" />
+              <q-btn flat dense no-caps size="sm" color="grey-5" :label="t('info.cancel')" @click="cancelEdit" />
+              <q-btn flat dense no-caps size="sm" color="primary" :label="t('info.save')" @click="saveName" />
             </div>
           </template>
           <template v-else>
@@ -100,22 +103,22 @@ const shortId = computed(() => {
               icon="edit"
               color="grey-5"
               class="rename-btn"
-              aria-label="Rename contact"
+               :aria-label="t('info.rename')"
               @click="startEdit"
             />
           </template>
         </div>
         <div class="info-status">
           <span class="dot" :class="conversation.online ? 'online' : 'offline'" />
-          {{ conversation.online ? "Online" : "Offline" }}
+           {{ conversation.online ? t("info.online") : t("info.offline") }}
         </div>
       </div>
 
       <q-separator :dark="$q.dark.isActive" class="q-my-sm" />
 
       <div class="info-section">
-        <div class="info-label">Node ID</div>
-        <div class="info-value mono" :title="displayId">{{ shortId }}</div>
+         <div class="info-label">{{ t("info.nodeId") }}</div>
+       <div class="info-value mono" :title="displayId">{{ shortId }}</div>
         <q-btn
           flat
           dense
@@ -123,10 +126,14 @@ const shortId = computed(() => {
           size="sm"
           color="primary"
           icon="content_copy"
-          label="Copy"
+           :label="t('info.copy')"
           class="q-mt-xs"
           @click="emit('copy', displayId)"
-        />
+       />
+      </div>
+
+      <div class="info-section">
+        <q-btn flat dense no-caps :color="verified ? 'positive' : 'primary'" :icon="verified ? 'verified' : 'verified_user'" :label="verified ? t('info.verified') : t('info.markVerified')" @click="toggleVerified" />
       </div>
 
       <q-separator :dark="$q.dark.isActive" class="q-my-sm" />
@@ -137,7 +144,7 @@ const shortId = computed(() => {
           no-caps
           color="negative"
           icon="person_remove"
-          label="Delete contact"
+           :label="t('info.delete')"
           class="full-width"
           @click="confirmDelete = true"
         />
@@ -146,18 +153,17 @@ const shortId = computed(() => {
       <q-dialog v-model="confirmDelete">
         <q-card class="bg-grey-9 text-white" style="min-width: 320px">
           <q-card-section>
-            <div class="text-h6">Delete contact?</div>
+             <div class="text-h6">{{ t("info.deleteTitle") }}</div>
             <div class="text-grey-5 q-mt-sm">
-              This removes "{{ conversation.name }}" and clears the local chat
-              history. Messages can't be recovered.
+               {{ t("info.deleteMessage", { name: conversation.name }) }}
             </div>
           </q-card-section>
           <q-card-actions align="right">
-            <q-btn flat label="Cancel" v-close-popup />
+             <q-btn flat :label="t('info.cancel')" v-close-popup />
             <q-btn
               flat
               color="negative"
-              label="Delete"
+               :label="t('common.delete')"
               v-close-popup
               @click="emit('delete')"
             />
@@ -168,7 +174,7 @@ const shortId = computed(() => {
     </template>
 
     <div v-else class="info-empty text-grey-6">
-      Select a conversation to see details
+       {{ t("info.empty") }}
     </div>
   </div>
 </template>

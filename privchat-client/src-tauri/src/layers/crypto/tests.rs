@@ -257,6 +257,28 @@ fn tamper_detected_and_state_unpoisoned() {
 }
 
 #[test]
+fn header_tamper_detected_and_state_unpoisoned() {
+    let (alice, bob, bob_id, alice_id) = peers();
+    let mut a = Ratchet::new(&alice, &bob_id).unwrap();
+    let mut b = Ratchet::new(&bob, &alice_id).unwrap();
+
+    let good = a.encrypt(b"hello").unwrap();
+    a.next();
+    let mut tampered = good.clone();
+    tampered[9] ^= 0x01; // 仅篡改同代 dh_pub；正文和 nonce 保持不变。
+    assert!(
+        b.decrypt(&tampered).is_err(),
+        "tampered header must fail authentication"
+    );
+
+    // 失败不记录伪造 eph、不推进接收链，原消息仍可正常解密。
+    assert_eq!(b.decrypt(&good).unwrap(), b"hello");
+    let next = a.encrypt(b"next").unwrap();
+    a.next();
+    assert_eq!(b.decrypt(&next).unwrap(), b"next");
+}
+
+#[test]
 fn failed_send_does_not_advance_chain() {
     let (alice, bob, bob_id, alice_id) = peers();
     let mut a = Ratchet::new(&alice, &bob_id).unwrap();
@@ -293,7 +315,7 @@ fn has_valid_prefix_works() {
 }
 
 #[test]
-fn v2_header_and_gen_n() {
+fn v4_header_and_gen_n() {
     let (alice, bob, bob_id, alice_id) = peers();
     let mut a = Ratchet::new(&alice, &bob_id).unwrap();
     let blob = a.encrypt(b"x").unwrap();
@@ -319,4 +341,42 @@ fn v2_header_and_gen_n() {
     b.next();
     assert_eq!(Ratchet::header_gen_n(&b0).unwrap(), (0, 0));
     assert_eq!(Ratchet::header_gen_n(&b1).unwrap(), (1, 0));
+}
+
+/// 离线/乱序失步回归：B 从未收到 A 的旧代消息（msg1 携带 eph_A0），
+/// 直接收到 A 的换代消息（gen1）。旧实现依赖 their_eph 报
+/// 换代消息头冗余携带
+/// prev_eph，B 凭 DH(own_eph_priv, header.prev_eph) 原地补课。
+#[test]
+fn offline_missed_old_eph_still_converges() {
+    let (alice, bob, bob_id, alice_id) = peers();
+    let mut a = Ratchet::new(&alice, &bob_id).unwrap();
+    let mut b = Ratchet::new(&bob, &alice_id).unwrap();
+
+    // A 发 msg1（gen0, eph_A0）到 mailbox，B 一直没拉取（从未见过 eph_A0）。
+    let msg1 = a.encrypt(b"a1").unwrap();
+    a.next();
+    assert_eq!(parse_header(&msg1).unwrap().gen, 0);
+
+    // B 上线后没拉 msg1，自己先发 msg2（gen0, eph_B0）。
+    let msg2 = b.encrypt(b"b1").unwrap();
+    b.next();
+    assert_eq!(parse_header(&msg2).unwrap().gen, 0);
+
+    // A 收到 msg2 后发起换代（gen1），消息头带 prev_eph=eph_A0。
+    assert_eq!(a.decrypt(&msg2).unwrap(), b"b1");
+    let msg3 = a.encrypt(b"a2").unwrap();
+    a.next();
+    let hdr = parse_header(&msg3).unwrap();
+    assert_eq!(hdr.gen, 1);
+    assert_ne!(hdr.prev_eph, [0u8; 32], "refresh msg must carry prev_eph");
+
+    // 关键断言：B 从未收到 msg1，仅凭 msg3 头里的 prev_eph 也能解密。
+    assert_eq!(b.decrypt(&msg3).unwrap(), b"a2");
+
+    // 后续双向通信正常，且迟到的 msg1 也能按序/乱序补收（pn 快进 + skipped）。
+    let msg4 = b.encrypt(b"b2").unwrap();
+    b.next();
+    assert_eq!(a.decrypt(&msg4).unwrap(), b"b2");
+    assert_eq!(b.decrypt(&msg1).unwrap(), b"a1");
 }

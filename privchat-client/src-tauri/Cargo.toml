@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 privchat-common = { path = "../../privchat-common" }
 tauri = { version = "2", features = ["custom-protocol"] }
 tauri-plugin-opener = "2"
+tauri-plugin-app = "2.0.0-alpha.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 iroh = "1.0.3"
@@ -41,12 +42,3 @@ pbkdf2 = "0.12"
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1"
-
-
-# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = "abort"
-strip = true

@@ -103,11 +103,7 @@ impl Identity {
         let (mut send, mut recv) = conn.open_bi().await?;
         send.write_all(payload).await?;
         send.finish()?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            recv.read_to_end(1024),
-        )
-        .await
+        match tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(1024)).await
         {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
@@ -141,7 +137,10 @@ impl Identity {
         // 让回程消息（bi-stream）也能被读出并投递给上层。
         let local_id = self.endpoint.id().to_string();
         spawn_conn_reader_with_local(self.tx.clone(), conn.clone(), local_id);
-        self.conns.write().await.insert(peer_id.to_string(), conn.clone());
+        self.conns
+            .write()
+            .await
+            .insert(peer_id.to_string(), conn.clone());
         Ok(conn)
     }
 }
@@ -159,13 +158,17 @@ pub struct Transport {
 
 impl Transport {
     /// 绑定专属身份端点并注册 ALPN 接收循环（使用 n0 默认 relay）。
-    pub async fn start(store: Arc<Store>) -> Result<(Self, mpsc::UnboundedReceiver<IncomingEnvelope>)> {
+    pub async fn start(
+        store: Arc<Store>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingEnvelope>)> {
         Self::start_inner(store, true).await
     }
 
     /// 以「禁用 relay、仅直连」模式启动，用于单机/内网集成测试。
     #[allow(dead_code)] // 仅在集成测试路径被引用
-    pub async fn start_no_relay(store: Arc<Store>) -> Result<(Self, mpsc::UnboundedReceiver<IncomingEnvelope>)> {
+    pub async fn start_no_relay(
+        store: Arc<Store>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingEnvelope>)> {
         Self::start_inner(store, false).await
     }
 
@@ -237,7 +240,10 @@ impl Transport {
         let local_id = secret.public().to_string();
         self.store.save_identity(&local_id, &secret.to_bytes())?;
         let id = build_identity(secret, self.use_relay, self.tx.clone()).await?;
-        self.identities.write().await.insert(local_id.clone(), Arc::new(id));
+        self.identities
+            .write()
+            .await
+            .insert(local_id.clone(), Arc::new(id));
         Ok(local_id)
     }
 
@@ -253,13 +259,19 @@ impl Transport {
         let secret = SecretKey::try_from(secret_bytes.as_slice())
             .map_err(|e| anyhow::anyhow!("bad stored identity: {e}"))?;
         let id = build_identity(secret, self.use_relay, self.tx.clone()).await?;
-        self.identities.write().await.insert(local_id.to_string(), Arc::new(id));
+        self.identities
+            .write()
+            .await
+            .insert(local_id.to_string(), Arc::new(id));
         Ok(true)
     }
 
     /// 删除一个专属身份（删除联系人时调用，释放 Endpoint 与数据库记录）。
     pub async fn drop_identity(&self, local_id: &str) {
-        self.identities.write().await.remove(local_id);
+        if let Some(identity) = self.identities.write().await.remove(local_id) {
+            let _ = identity.router.shutdown().await;
+            identity.endpoint.close().await;
+        }
         let _ = self.store.delete_identity(local_id);
     }
 
@@ -274,7 +286,14 @@ impl Transport {
         let id = identities
             .get(local_id)
             .ok_or_else(|| anyhow::anyhow!("unknown local identity: {local_id}"))?;
-        id.connect_peer(peer_id_or_ticket).await
+        let expected = self.parse_peer_id(peer_id_or_ticket)?;
+        let actual = id.connect_peer(peer_id_or_ticket).await?;
+        if actual != expected {
+            return Err(anyhow::anyhow!(
+                "identity conflict: expected {expected}, got {actual}"
+            ));
+        }
+        Ok(actual)
     }
 
     /// 从邀请串（纯 peer_id 或完整票据）解析出对方 peer_id，不建立连接。
@@ -316,10 +335,17 @@ impl Transport {
         String::new()
     }
 
-    /// 主动关闭全部专属身份端点并释放端口（重启测试/退出前调用）。
-    #[allow(dead_code)] // 供上层退出流程调用
+    /// 主动关闭全部专属身份路由和端点，停止所有网络活动。
     pub async fn close(&self) {
-        for id in self.identities.read().await.values() {
+        let identities: Vec<_> = self
+            .identities
+            .write()
+            .await
+            .drain()
+            .map(|(_, id)| id)
+            .collect();
+        for id in identities {
+            let _ = id.router.shutdown().await;
             id.endpoint.close().await;
         }
     }
@@ -345,8 +371,7 @@ async fn build_identity(
     let endpoint = builder.bind().await?;
 
     let conns: Arc<RwLock<HashMap<String, Connection>>> = Arc::new(RwLock::new(HashMap::new()));
-    let peers: Arc<RwLock<HashMap<String, EndpointAddr>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let peers: Arc<RwLock<HashMap<String, EndpointAddr>>> = Arc::new(RwLock::new(HashMap::new()));
     let local_id = endpoint.id().to_string();
     let router = Router::builder(endpoint.clone())
         .accept(
@@ -364,11 +389,7 @@ async fn build_identity(
         // 等待端点上线（已联系上 relay），确保地址可被远端拨号。
         // 加限时：relay 不可达（离线/被墙/模拟器无外网）时不阻塞启动，
         // 否则 `online()` 会永远等待导致解锁界面卡死。
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            endpoint.online(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), endpoint.online()).await;
     }
 
     Ok(Identity {
@@ -408,7 +429,11 @@ fn spawn_conn_reader_with_local(
             // 读完即关闭应答流：对端 `send` 的 read_to_end 立刻返回，无需等 10s 超时。
             let _ = send.finish();
             if tx
-                .send(IncomingEnvelope { local_id: local_id.clone(), peer_id: peer_id.clone(), payload })
+                .send(IncomingEnvelope {
+                    local_id: local_id.clone(),
+                    peer_id: peer_id.clone(),
+                    payload,
+                })
                 .is_err()
             {
                 break;
@@ -433,7 +458,10 @@ impl ProtocolHandler for EnvelopeHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer_id = connection.remote_id().to_string();
         // 缓存入站连接：对端可通过此连接回程投递（单向队列回程）。
-        self.conns.write().await.insert(peer_id.clone(), connection.clone());
+        self.conns
+            .write()
+            .await
+            .insert(peer_id.clone(), connection.clone());
         // 登记对端地址（从入站连接还原）：让本端（被动方）之后也能
         // 主动拨号回去。生产路径以纯 peer_id 建立联系人，地址靠 Pkarr
         // 解析，此处按入站连接的实际路径补齐 relay/ip，重连更稳。

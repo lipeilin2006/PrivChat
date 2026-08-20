@@ -11,8 +11,12 @@ async fn two_clients_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 
-    let (alice, mut rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
+    let (alice, mut rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
 
     // 双方互相通过专属身份邀请串（完整票据）建立好友关系。
     let alice_invite = alice.self_ticket().await;
@@ -22,8 +26,17 @@ async fn two_clients_roundtrip() {
 
     // 注意：no-relay 模式无法经 DNS 解析地址，测试用完整票据连接；
     // 因此把「专属身份 peer_id -> 该身份票据」的映射提供给对方。
-    let bob_id = alice.connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, Some("Bob".into())).await.expect("a->b");
-    let alice_id = bob.connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None).await.expect("b->a");
+    let bob_id = alice
+        .connect_peer(
+            &bob.transport.ticket_for(&bob_for_alice).await,
+            Some("Bob".into()),
+        )
+        .await
+        .expect("a->b");
+    let alice_id = bob
+        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
+        .await
+        .expect("b->a");
     assert_eq!(bob_id, bob_for_alice);
     assert_eq!(alice_id, alice_for_bob);
 
@@ -33,7 +46,11 @@ async fn two_clients_roundtrip() {
         .await
         .expect("alice send");
     let env = rx_b.recv().await.expect("bob envelope");
-    let msg = bob.handle_incoming(env).await.expect("bob recv").expect("text");
+    let msg = bob
+        .handle_incoming(env)
+        .await
+        .expect("bob recv")
+        .expect("text");
     assert_eq!(msg.text, "hello bob");
     assert_eq!(msg.from, alice_for_bob);
 
@@ -42,7 +59,11 @@ async fn two_clients_roundtrip() {
         .await
         .expect("bob send");
     let env = rx_a.recv().await.expect("alice envelope");
-    let msg = alice.handle_incoming(env).await.expect("alice recv").expect("text");
+    let msg = alice
+        .handle_incoming(env)
+        .await
+        .expect("alice recv")
+        .expect("text");
     assert_eq!(msg.text, "hi alice");
     assert_eq!(msg.from, bob_for_alice);
 
@@ -60,18 +81,38 @@ async fn contacts_persist_across_restart() {
     let _ = std::fs::remove_dir_all(&dir_b);
 
     // 第一轮：建立好友 + 发送一条消息。
-    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
-    let alice_for_bob = alice.transport.parse_peer_id(&alice.self_ticket().await).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob.self_ticket().await).unwrap();
-    let bob_id = alice.connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None).await.expect("a->b");
-    let alice_id = bob.connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None).await.expect("b->a");
+    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
+    let alice_for_bob = alice
+        .transport
+        .parse_peer_id(&alice.self_ticket().await)
+        .unwrap();
+    let bob_for_alice = bob
+        .transport
+        .parse_peer_id(&bob.self_ticket().await)
+        .unwrap();
+    let bob_id = alice
+        .connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None)
+        .await
+        .expect("a->b");
+    let alice_id = bob
+        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
+        .await
+        .expect("b->a");
     alice
         .send_message(&bob_id, "hello bob")
         .await
         .expect("alice send");
     let env = rx_b.recv().await.expect("bob envelope");
-    let msg = bob.handle_incoming(env).await.expect("bob recv").expect("text");
+    let msg = bob
+        .handle_incoming(env)
+        .await
+        .expect("bob recv")
+        .expect("text");
     assert_eq!(msg.text, "hello bob");
 
     // 模拟重启：先关闭释放端口，再丢弃内存态。
@@ -79,18 +120,28 @@ async fn contacts_persist_across_restart() {
     bob.close().await;
     drop(alice);
     drop(bob);
-    let (alice2, mut rx_a2) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("restart a");
-    let (bob2, mut rx_b2) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("restart b");
+    let (alice2, mut rx_a2) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("restart a");
+    let (bob2, mut rx_b2) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("restart b");
 
     // 重启后联系人自动恢复，且仍用同一专属身份。
     let a_contacts = alice2.list_contacts().await;
     let b_contacts = bob2.list_contacts().await;
     assert_eq!(
-        a_contacts.iter().map(|c| c.peer_id.as_str()).collect::<Vec<_>>(),
+        a_contacts
+            .iter()
+            .map(|c| c.peer_id.as_str())
+            .collect::<Vec<_>>(),
         vec![bob_id.as_str()]
     );
     assert_eq!(
-        b_contacts.iter().map(|c| c.peer_id.as_str()).collect::<Vec<_>>(),
+        b_contacts
+            .iter()
+            .map(|c| c.peer_id.as_str())
+            .collect::<Vec<_>>(),
         vec![alice_id.as_str()]
     );
 
@@ -105,15 +156,22 @@ async fn contacts_persist_across_restart() {
         .await
         .expect("alice2 send");
     let env = rx_b2.recv().await.expect("bob2 envelope");
-    let msg = bob2.handle_incoming(env).await.expect("bob2 recv").expect("text");
+    let msg = bob2
+        .handle_incoming(env)
+        .await
+        .expect("bob2 recv")
+        .expect("text");
     assert_eq!(msg.text, "still here");
 
-    bob2
-        .send_message(&alice_id, "yes still here")
+    bob2.send_message(&alice_id, "yes still here")
         .await
         .expect("bob2 send");
     let env = rx_a2.recv().await.expect("alice2 envelope");
-    let msg = alice2.handle_incoming(env).await.expect("alice2 recv").expect("text");
+    let msg = alice2
+        .handle_incoming(env)
+        .await
+        .expect("alice2 recv")
+        .expect("text");
     assert_eq!(msg.text, "yes still here");
 
     let _ = std::fs::remove_dir_all(&dir_a);
@@ -130,13 +188,29 @@ async fn rapid_burst_all_delivered() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 
-    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
+    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
 
-    let alice_for_bob = alice.transport.parse_peer_id(&alice.self_ticket().await).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob.self_ticket().await).unwrap();
-    let bob_id = alice.connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None).await.expect("a->b");
-    let alice_id = bob.connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None).await.expect("b->a");
+    let alice_for_bob = alice
+        .transport
+        .parse_peer_id(&alice.self_ticket().await)
+        .unwrap();
+    let bob_for_alice = bob
+        .transport
+        .parse_peer_id(&bob.self_ticket().await)
+        .unwrap();
+    let bob_id = alice
+        .connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, None)
+        .await
+        .expect("a->b");
+    let alice_id = bob
+        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
+        .await
+        .expect("b->a");
 
     // 并发快速连发 12 条（模拟前端高频发送）。
     let texts: Vec<String> = (0..12).map(|i| format!("burst {i}")).collect();
@@ -156,14 +230,15 @@ async fn rapid_burst_all_delivered() {
     // 接收方必须收到全部 12 条且按 (gen, n) 顺序不乱。
     let mut received = Vec::new();
     for _ in 0..12 {
-        let env = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
-            rx_b.recv(),
-        )
-        .await
-        .expect("bob envelope timeout")
-        .expect("bob envelope");
-        let msg = bob.handle_incoming(env).await.expect("bob recv").expect("text");
+        let env = tokio::time::timeout(std::time::Duration::from_secs(20), rx_b.recv())
+            .await
+            .expect("bob envelope timeout")
+            .expect("bob envelope");
+        let msg = bob
+            .handle_incoming(env)
+            .await
+            .expect("bob recv")
+            .expect("text");
         received.push(msg.text);
     }
     assert_eq!(received, texts, "all burst messages must arrive in order");
@@ -189,14 +264,21 @@ async fn single_invite_bidirectional() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 
-    let (alice, mut rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
+    let (alice, mut rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, mut rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
 
     // 只有 Alice 出邀请（专属身份）。测试因无 DNS 用完整票据。
     let alice_invite = alice.self_ticket().await;
     let alice_for_bob = alice.transport.parse_peer_id(&alice_invite).unwrap();
     let alice_ticket = alice.transport.ticket_for(&alice_for_bob).await;
-    let alice_id = bob.connect_peer(&alice_ticket, Some("Alice".into())).await.expect("b->a");
+    let alice_id = bob
+        .connect_peer(&alice_ticket, Some("Alice".into()))
+        .await
+        .expect("b->a");
     assert_eq!(alice_id, alice_for_bob);
 
     // Bob 首条消息。
@@ -204,7 +286,11 @@ async fn single_invite_bidirectional() {
         .await
         .expect("bob send");
     let env = rx_a.recv().await.expect("alice envelope");
-    let msg = alice.handle_incoming(env).await.expect("alice recv").expect("text");
+    let msg = alice
+        .handle_incoming(env)
+        .await
+        .expect("alice recv")
+        .expect("text");
     assert_eq!(msg.text, "hi alice");
 
     // Alice 自动建立了对 Bob 的联系人（无需 Bob 的邀请）。
@@ -216,11 +302,16 @@ async fn single_invite_bidirectional() {
     let bob_id = msg.from.clone();
 
     // Alice 回信。
-    alice.send_message(&bob_id, "hi bob")
+    alice
+        .send_message(&bob_id, "hi bob")
         .await
         .expect("alice reply");
     let env = rx_b.recv().await.expect("bob envelope");
-    let msg = bob.handle_incoming(env).await.expect("bob recv").expect("text");
+    let msg = bob
+        .handle_incoming(env)
+        .await
+        .expect("bob recv")
+        .expect("text");
     assert_eq!(msg.text, "hi bob");
     assert_eq!(msg.from, alice_for_bob);
 
@@ -236,15 +327,37 @@ async fn delete_contact_cleans_everything() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 
-    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, _rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
-    let alice_for_bob = alice.transport.parse_peer_id(&alice.self_ticket().await).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob.self_ticket().await).unwrap();
-    let bob_id = alice.connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, Some("Bob".into())).await.expect("a->b");
-    let _alice_id = bob.connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None).await.expect("b->a");
+    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, _rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
+    let alice_for_bob = alice
+        .transport
+        .parse_peer_id(&alice.self_ticket().await)
+        .unwrap();
+    let bob_for_alice = bob
+        .transport
+        .parse_peer_id(&bob.self_ticket().await)
+        .unwrap();
+    let bob_id = alice
+        .connect_peer(
+            &bob.transport.ticket_for(&bob_for_alice).await,
+            Some("Bob".into()),
+        )
+        .await
+        .expect("a->b");
+    let _alice_id = bob
+        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
+        .await
+        .expect("b->a");
 
     // 先发一条消息产生历史。
-    alice.send_message(&bob_id, "before delete").await.expect("send");
+    alice
+        .send_message(&bob_id, "before delete")
+        .await
+        .expect("send");
     assert!(!alice.get_history(&bob_id).await.is_empty());
 
     // 删除后：联系人、历史全部消失。
@@ -255,7 +368,9 @@ async fn delete_contact_cleans_everything() {
     // 重启后仍然保持删除（持久化生效）。
     alice.close().await;
     drop(alice);
-    let (alice2, _rx_a2) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("restart a");
+    let (alice2, _rx_a2) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("restart a");
     assert!(alice2.list_contacts().await.is_empty());
     assert!(alice2.get_history(&bob_id).await.is_empty());
 
@@ -273,14 +388,33 @@ async fn handle_incoming_rejects_identity_conflicts() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 
-    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY).await.expect("start a");
-    let (bob, _rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY).await.expect("start b");
+    let (alice, _rx_a) = App::start_no_relay(dir_a.clone(), TEST_KEY)
+        .await
+        .expect("start a");
+    let (bob, _rx_b) = App::start_no_relay(dir_b.clone(), TEST_KEY)
+        .await
+        .expect("start b");
 
     // Alice 与 Bob 双向建立：Alice 对 Bob 生成专属身份 alice_for_bob。
-    let alice_for_bob = alice.transport.parse_peer_id(&alice.self_ticket().await).unwrap();
-    let bob_for_alice = bob.transport.parse_peer_id(&bob.self_ticket().await).unwrap();
-    let bob_id = alice.connect_peer(&bob.transport.ticket_for(&bob_for_alice).await, Some("Bob".into())).await.expect("a->b");
-    let _alice_id = bob.connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None).await.expect("b->a");
+    let alice_for_bob = alice
+        .transport
+        .parse_peer_id(&alice.self_ticket().await)
+        .unwrap();
+    let bob_for_alice = bob
+        .transport
+        .parse_peer_id(&bob.self_ticket().await)
+        .unwrap();
+    let bob_id = alice
+        .connect_peer(
+            &bob.transport.ticket_for(&bob_for_alice).await,
+            Some("Bob".into()),
+        )
+        .await
+        .expect("a->b");
+    let _alice_id = bob
+        .connect_peer(&alice.transport.ticket_for(&alice_for_bob).await, None)
+        .await
+        .expect("b->a");
 
     let alice_contacts = alice.list_contacts().await;
     let alice_local_for_bob = alice_contacts
@@ -305,7 +439,11 @@ async fn handle_incoming_rejects_identity_conflicts() {
         .unwrap(),
     };
     assert!(
-        alice.handle_incoming(forge1).await.expect("reject").is_none(),
+        alice
+            .handle_incoming(forge1)
+            .await
+            .expect("reject")
+            .is_none(),
         "identity already bound to bob must reject mallory"
     );
 
@@ -323,7 +461,11 @@ async fn handle_incoming_rejects_identity_conflicts() {
         .unwrap(),
     };
     assert!(
-        alice.handle_incoming(forge2).await.expect("reject").is_none(),
+        alice
+            .handle_incoming(forge2)
+            .await
+            .expect("reject")
+            .is_none(),
         "peer already bound to other identity must reject"
     );
 
@@ -355,7 +497,10 @@ async fn two_clients_roundtrip_with_relay() {
     let alice_for_bob = alice.transport.parse_peer_id(&alice_invite).unwrap();
     let bob_for_alice = bob.transport.parse_peer_id(&bob_invite).unwrap();
 
-    let bob_id = alice.connect_peer(&bob_invite, Some("Bob".into())).await.expect("a->b");
+    let bob_id = alice
+        .connect_peer(&bob_invite, Some("Bob".into()))
+        .await
+        .expect("a->b");
     let alice_id = bob.connect_peer(&alice_invite, None).await.expect("b->a");
     assert_eq!(bob_id, bob_for_alice);
     assert_eq!(alice_id, alice_for_bob);
@@ -365,14 +510,22 @@ async fn two_clients_roundtrip_with_relay() {
         .await
         .expect("alice send");
     let env = rx_b.recv().await.expect("bob envelope");
-    let msg = bob.handle_incoming(env).await.expect("bob recv").expect("text");
+    let msg = bob
+        .handle_incoming(env)
+        .await
+        .expect("bob recv")
+        .expect("text");
     assert_eq!(msg.text, "hello bob via relay");
 
     bob.send_message(&alice_id, "hi alice via relay")
         .await
         .expect("bob send");
     let env = rx_a.recv().await.expect("alice envelope");
-    let msg = alice.handle_incoming(env).await.expect("alice recv").expect("text");
+    let msg = alice
+        .handle_incoming(env)
+        .await
+        .expect("alice recv")
+        .expect("text");
     assert_eq!(msg.text, "hi alice via relay");
 
     alice.close().await;
@@ -428,7 +581,9 @@ async fn mailbox_grid_sync_end_to_end() {
     let msg_id = msg_id_for(&alice_id, &blob);
 
     // client0 身份：PUT 到 mailbox0。
-    let alice_mb = MailboxClient::start(dir_a.clone()).await.expect("alice mailbox");
+    let alice_mb = MailboxClient::start(dir_a.clone())
+        .await
+        .expect("alice mailbox");
     MailboxClient::put(&alice_mb, &mb0, &bob_id, &msg_id, blob.clone())
         .await
         .expect("put to mailbox0");
@@ -437,21 +592,26 @@ async fn mailbox_grid_sync_end_to_end() {
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     // client1 身份：从 mailbox1 fetch 并解密（节点侧取回即删，并广播删除同步）。
-    let bob_mb = MailboxClient::start(dir_b.clone()).await.expect("bob mailbox");
-    let fetched = MailboxClient::fetch(&bob_mb, &mb1, &bob_id).await.expect("fetch from mailbox1");
+    let bob_mb = MailboxClient::start(dir_b.clone())
+        .await
+        .expect("bob mailbox");
+    let fetched = MailboxClient::fetch(&bob_mb, &mb1, &bob_id)
+        .await
+        .expect("fetch from mailbox1");
     let stored = fetched
         .iter()
         .find(|m| m.msg_id == msg_id)
         .expect("message synced to mailbox1");
-    let plain2 =
-        ratchet_b.decrypt(&stored.msg).expect("decrypt");
+    let plain2 = ratchet_b.decrypt(&stored.msg).expect("decrypt");
     let got: PlainMsg = serde_json::from_slice(&plain2).unwrap();
     assert_eq!(got.msg_text, "grid hello from client0");
 
     // 清理验证：fetch 取回即删 + 网格反向同步，mailbox0 的副本也应被删除。
     // 队列归属认证：只能用 Bob 自己的身份（bob_mb）检查 Bob 的队列。
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-    let after = MailboxClient::fetch(&bob_mb, &mb0, &bob_id).await.expect("recheck mailbox0");
+    let after = MailboxClient::fetch(&bob_mb, &mb0, &bob_id)
+        .await
+        .expect("recheck mailbox0");
     assert!(
         !after.iter().any(|m| m.msg_id == msg_id),
         "fetch-delete should remove from mailbox0 via grid"

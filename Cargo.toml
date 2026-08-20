@@ -5,8 +5,7 @@
 # - privchat-common           : mailbox 客户端 / 节点共享 wire 协议与 PoW
 # - privchat-mailbox          : 离线消息缓存节点（可组网同步）
 #
-# 各成员自带 `[profile.release]`（LTO 等），但 workspace 内成员级 profile
-# 会被忽略，故此处统一定义（值需与成员保持同步，尤其 WSL 独立构建）。
+# release profile 只能在 workspace 根生效，统一放在这里避免成员配置被忽略。
 [profile.release]
 codegen-units = 1
 lto = true

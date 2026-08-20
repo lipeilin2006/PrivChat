@@ -1,7 +1,8 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { onBackButtonPress } from "@tauri-apps/api/app";
 import { useQuasar } from "quasar";
 import ContactsPanel from "./components/ContactsPanel.vue";
 import ChatWindow from "./components/ChatWindow.vue";
@@ -9,11 +10,13 @@ import ChatInfoPanel from "./components/ChatInfoPanel.vue";
 import Settings from "./components/Settings.vue";
 import MailboxSettings from "./components/MailboxSettings.vue";
 import MyId from "./components/MyId.vue";
+import { useI18n } from "./i18n";
+import { useMobileNavigation } from "./composables/useMobileNavigation";
 
 const $q = useQuasar();
+const { t } = useI18n();
 
 const conversations = ref([]);
-const activeId = ref(null);
 const ready = ref(false);
 // 保险箱解锁门：unlocked=false 时只显示密码界面。
 const unlocked = ref(false);
@@ -21,12 +24,18 @@ const vaultInitialized = ref(false);
 const vaultBusy = ref(false);
 const vaultPassword = ref("");
 const vaultError = ref("");
+const lockTimer = ref(null);
 const vaultMode = computed(() =>
   vaultInitialized.value ? "unlock" : "create"
 );
-// 移动端单屏视图：list | chat | settings | add | mailbox | info
-const view = ref("list");
+const { view, activeId, push: pushMobile, back: backMobile, replace: replaceMobile, onPopState } = useMobileNavigation();
 const showInfo = ref(false); // desktop: right-hand chat info panel
+const searchDialog = ref(false);
+const messageQuery = ref("");
+const searchFrom = ref("");
+const searchTo = ref("");
+const searchResults = ref([]);
+const searching = ref(false);
 
 const messagesByConv = reactive({});
 // peer_id → 本端为该联系人使用的专属身份（判定消息归属 me/peer）。
@@ -76,6 +85,34 @@ function getMessages(peerId) {
   return messagesByConv[peerId];
 }
 
+async function searchMessages() {
+  if (!messageQuery.value.trim()) return;
+  searching.value = true;
+  try {
+    const rows = await invoke("search_messages", { query: messageQuery.value.trim(), limit: 500 });
+    const from = searchFrom.value ? Date.parse(searchFrom.value) : 0;
+    const to = searchTo.value ? Date.parse(`${searchTo.value}T23:59:59`) : Infinity;
+    searchResults.value = (rows || []).filter(([, message]) => message.time >= from && message.time <= to);
+  } catch (error) {
+    $q.notify({ type: "negative", message: displayError(error), position: "bottom" });
+  } finally {
+    searching.value = false;
+  }
+}
+
+function openSearch(query = "") {
+  searchDialog.value = true;
+  messageQuery.value = query;
+  searchResults.value = [];
+  if (query) searchMessages();
+}
+
+function selectSearchResult(peerId) {
+  searchDialog.value = false;
+  const conversation = conversations.value.find((item) => item.nodeId === peerId);
+  if (conversation) selectConversation(conversation.id);
+}
+
 async function selectConversation(id) {
   activeId.value = id;
   const conv = conversations.value.find((c) => c.id === id);
@@ -94,41 +131,59 @@ async function selectConversation(id) {
       console.error("load history failed", e);
     }
   }
-  if (isMobile.value) view.value = "chat";
+  if (isMobile.value) pushMobile("chat", id);
 }
 
 function goToList() {
-  view.value = "list";
-  activeId.value = null;
+  if (isMobile.value) backMobile();
+  else replaceMobile("list");
 }
 
 function openSettings() {
-  view.value = "settings";
+  pushMobile("settings");
 }
 
 function openAdd() {
-  view.value = "add";
+  pushMobile("add");
 }
 
 function openMailbox() {
-  view.value = "mailbox";
+  pushMobile("mailbox");
 }
 
 function closeOverlay() {
-  view.value = activeId.value ? "chat" : "list";
+  if (isMobile.value) {
+    backMobile();
+  } else {
+    view.value = activeId.value ? "chat" : "list";
+  }
 }
 
 function openInfo() {
   if (isMobile.value) {
-    view.value = "info";
+    pushMobile("info");
   } else {
     showInfo.value = !showInfo.value;
   }
 }
 
 function closeInfo() {
-  if (isMobile.value) view.value = "chat";
+  if (isMobile.value) backMobile();
 }
+
+async function handleBackButton() {
+  if (!isMobile.value) return;
+  const active = document.activeElement;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    active.blur();
+    return;
+  }
+  // The Android app plugin emits this event only when WebView history can go
+  // back. Let the popstate handler apply the previous mobile route.
+  await backMobile();
+}
+
+let unlistenBackButton = null;
 
 async function onAdded(peerId) {
   // 添加联系人成功：把新联系人同步进内存列表，避免重启才显示。
@@ -141,7 +196,7 @@ async function onAdded(peerId) {
       added?.name || peerId.slice(0, 10),
       added?.local_id || ""
     );
-    conv.lastMessage = conv.lastMessage || "Peer connected";
+     conv.lastMessage = conv.lastMessage || t("contacts.messages");
     if (!conv.timestamp) conv.timestamp = Date.now();
     activeId.value = conv.id;
     if (isMobile.value) view.value = "chat";
@@ -169,9 +224,9 @@ async function deleteContactById(peerId) {
       showInfo.value = false;
       if (isMobile.value) view.value = "list";
     }
-    $q.notify({ type: "positive", message: "Contact deleted", position: "bottom" });
+     $q.notify({ type: "positive", message: t("notify.deleted"), position: "bottom" });
   } catch (e) {
-    $q.notify({ type: "negative", message: `Delete failed: ${e}`, position: "bottom" });
+     $q.notify({ type: "negative", message: t("notify.deleteFailed", { error: e }), position: "bottom" });
   }
 }
 
@@ -182,28 +237,33 @@ async function renameContact(peerId, name) {
     const conv = conversations.value.find((c) => c.nodeId === peerId);
     if (conv && updated) conv.name = updated.name;
     if (updated) localIdByPeer[peerId] = updated.local_id || localIdByPeer[peerId];
-    $q.notify({ type: "positive", message: "Name updated", position: "bottom" });
+     $q.notify({ type: "positive", message: t("notify.renamed"), position: "bottom" });
     return true;
   } catch (e) {
-    $q.notify({ type: "negative", message: `Rename failed: ${e}`, position: "bottom" });
+     $q.notify({ type: "negative", message: t("notify.renameFailed", { error: e }), position: "bottom" });
     return false;
   }
 }
 
 async function doSend(msg, peerId) {
+  if (msg.status === "resending") return false;
+  msg.status = msg.retryCount ? "resending" : "sending";
   try {
     const result = await invoke("send_message", { peerId, text: msg.text });
     msg.id = result.id;
     msg.ts = result.time;
     msg.status = "sent";
+    msg.error = "";
     const conv = conversations.value.find((c) => c.nodeId === peerId);
     if (conv) conv.lastStatus = "sent";
     return true;
   } catch (e) {
     msg.status = "failed";
+    msg.error = displayError(e);
+    msg.retryCount = (msg.retryCount || 0) + 1;
     const conv = conversations.value.find((c) => c.nodeId === peerId);
     if (conv) conv.lastStatus = "failed";
-    $q.notify({ type: "negative", message: `Send failed: ${e}`, position: "bottom" });
+     $q.notify({ type: "negative", message: t("notify.sendFailed", { error: msg.error }), position: "bottom" });
     return false;
   }
 }
@@ -219,6 +279,8 @@ function sendMessage(text) {
     text,
     ts: Date.now(),
     status: "sending",
+    retryCount: 0,
+    error: "",
   });
   getMessages(peerId).push(msg);
   activeConv.value.lastMessage = text;
@@ -230,14 +292,14 @@ function sendMessage(text) {
 // 失败消息点击重发：把该条消息置底（与接收方送达顺序一致）并置回
 // 「发送中」后重新投递。
 function resendMessage(msg) {
-  if (!activeConv.value || !msg) return;
+  if (!activeConv.value || !msg || msg.status !== "failed") return;
   const msgs = getMessages(activeConv.value.nodeId);
   const idx = msgs.indexOf(msg);
   if (idx !== -1) {
     msgs.splice(idx, 1);
     msgs.push(msg);
   }
-  msg.status = "sending";
+  msg.status = "resending";
   activeConv.value.lastStatus = "sending";
   activeConv.value.lastMessage = msg.text;
   activeConv.value.timestamp = Date.now();
@@ -247,9 +309,9 @@ function resendMessage(msg) {
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
-    $q.notify({ type: "positive", message: "Copied to clipboard", position: "bottom" });
+     $q.notify({ type: "positive", message: t("common.copied"), position: "bottom" });
   } catch (e) {
-    $q.notify({ type: "negative", message: `Copy failed: ${e}`, position: "bottom" });
+     $q.notify({ type: "negative", message: t("chat.copyFailed", { error: e }), position: "bottom" });
   }
 }
 
@@ -267,11 +329,92 @@ async function submitVault() {
       unlocked.value = true;
       await loadLocalState();
       await listenForMessages();
+      await loadAutoLockSetting();
+      startAutoLockTimer();
     }
   } catch (e) {
-    vaultError.value = String(e);
+    vaultError.value = displayError(e);
   } finally {
     vaultBusy.value = false;
+  }
+}
+
+async function lockVault() {
+  try {
+    Object.values(messagesByConv).flat().forEach((message) => {
+      if (message.status === "sending" || message.status === "resending") {
+        message.status = "cancelled";
+        message.error = t("chat.cancelled");
+      }
+    });
+    await invoke("lock_vault");
+    unlocked.value = false;
+    vaultPassword.value = "";
+    vaultError.value = "";
+    conversations.value = [];
+    activeId.value = null;
+    showInfo.value = false;
+    Object.keys(messagesByConv).forEach((key) => delete messagesByConv[key]);
+    Object.keys(localIdByPeer).forEach((key) => delete localIdByPeer[key]);
+    try {
+      await navigator.clipboard.writeText("");
+    } catch {
+      // Clipboard permission is optional; in-memory state is still cleared.
+    }
+    document.querySelectorAll("input, textarea").forEach((element) => {
+      element.value = "";
+    });
+    clearInterval(lockTimer.value);
+    lockTimer.value = null;
+    view.value = "list";
+  } catch (error) {
+    vaultError.value = displayError(error);
+  }
+}
+
+function startAutoLockTimer() {
+  clearInterval(lockTimer.value);
+  const minutes = Number(autoLockMinutes.value);
+  if (!minutes) return;
+  lockTimer.value = setTimeout(lockVault, minutes * 60 * 1000);
+}
+
+function refreshAutoLockTimer() {
+  if (unlocked.value) startAutoLockTimer();
+}
+
+function onAutoLockChanged(minutes) {
+  autoLockMinutes.value = Number(minutes);
+  startAutoLockTimer();
+}
+
+function onVisibilityChanged() {
+  if (document.visibilityState === "hidden" && unlocked.value && autoLockMinutes.value) {
+    lockVault();
+  }
+}
+
+function displayError(error) {
+  if (typeof error !== "string") return error?.message || t("notify.operationFailed");
+  try {
+    return JSON.parse(error)?.message || t("notify.operationFailed");
+  } catch {
+    return error;
+  }
+}
+
+async function exportDiagnostics() {
+  try {
+    const data = await invoke("export_diagnostics");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "privchat-diagnostics.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    $q.notify({ type: "negative", message: displayError(error), position: "bottom" });
   }
 }
 
@@ -306,6 +449,18 @@ watch(
 
 onMounted(async () => {
   syncThemeClass();
+  replaceMobile("list");
+  window.addEventListener("popstate", onPopState);
+  window.addEventListener("pointerdown", refreshAutoLockTimer, { passive: true });
+  window.addEventListener("keydown", refreshAutoLockTimer, { passive: true });
+  document.addEventListener("visibilitychange", onVisibilityChanged);
+
+  // Android 系统返回键先按前端页面层级回退，根列表页才退出应用。
+  try {
+    unlistenBackButton = await onBackButtonPress(handleBackButton);
+  } catch {
+    // 桌面端和不支持该插件的环境忽略此监听。
+  }
 
   // 保险箱门：先查状态，未解锁时不加载任何本地数据。
   try {
@@ -315,11 +470,37 @@ onMounted(async () => {
       unlocked.value = true;
       await loadLocalState();
       await listenForMessages();
+      await loadAutoLockSetting();
+      startAutoLockTimer();
     }
   } catch (e) {
     console.error("vault_status failed", e);
   }
   ready.value = true;
+});
+
+const autoLockMinutes = ref(0);
+async function loadAutoLockSetting() {
+  try {
+    autoLockMinutes.value = await invoke("get_auto_lock_minutes");
+  } catch {
+    autoLockMinutes.value = 0;
+  }
+}
+
+async function saveAutoLockSetting(minutes) {
+  await invoke("set_auto_lock_minutes", { minutes: Number(minutes) });
+  autoLockMinutes.value = Number(minutes);
+  startAutoLockTimer();
+}
+
+onBeforeUnmount(() => {
+  unlistenBackButton?.unregister?.();
+  window.removeEventListener("popstate", onPopState);
+  window.removeEventListener("pointerdown", refreshAutoLockTimer);
+  window.removeEventListener("keydown", refreshAutoLockTimer);
+  document.removeEventListener("visibilitychange", onVisibilityChanged);
+  clearTimeout(lockTimer.value);
 });
 
 // 解锁成功后加载本地联系人、历史与入站消息监听。
@@ -383,13 +564,13 @@ async function listenForMessages() {
     <div class="vault-card">
       <div class="vault-logo">P</div>
       <h2 class="vault-title">
-        {{ vaultMode === "create" ? "Create your password" : "Enter password" }}
+         {{ vaultMode === "create" ? t("vault.createTitle") : t("vault.unlockTitle") }}
       </h2>
       <p class="vault-hint">
         {{
           vaultMode === "create"
-            ? "First launch: choose a password to encrypt all local data. It cannot be recovered if forgotten."
-            : "All local data is encrypted. Enter your password to unlock."
+             ? t("vault.createHint")
+             : t("vault.unlockHint")
         }}
       </p>
       <q-input
@@ -398,7 +579,7 @@ async function listenForMessages() {
         filled
         dense
         autofocus
-        placeholder="Password"
+         :placeholder="t('vault.password')"
         :dark="$q.dark.isActive"
         :error="!!vaultError"
         :error-message="vaultError || undefined"
@@ -407,7 +588,7 @@ async function listenForMessages() {
       <q-btn
         class="vault-submit full-width"
         color="primary"
-        label="Unlock"
+         :label="t('vault.unlock')"
         :loading="vaultBusy"
         :disable="!vaultPassword"
         @click="submitVault"
@@ -427,6 +608,7 @@ async function listenForMessages() {
           @add="openAdd"
           @settings="openSettings"
           @delete="deleteContactById"
+          @search-messages="openSearch"
         />
       </aside>
       <main class="app-main">
@@ -450,10 +632,13 @@ async function listenForMessages() {
       <!-- 桌面端 Settings / Add / Mailbox 以右侧浮层展示 -->
       <q-dialog v-model="overlayOpen" :maximized="false" position="right">
         <div class="desktop-overlay">
-          <Settings
-            v-if="view === 'settings'"
-            @close="closeOverlay"
-            @open-mailbox="openMailbox"
+           <Settings
+             v-if="view === 'settings'"
+             @close="closeOverlay"
+             @open-mailbox="openMailbox"
+             @lock="lockVault"
+             @auto-lock-changed="onAutoLockChanged"
+             @diagnostics="exportDiagnostics"
           />
           <MyId v-else-if="view === 'add'" @close="closeOverlay" @added="onAdded" />
           <MailboxSettings v-else @close="closeOverlay" />
@@ -472,6 +657,7 @@ async function listenForMessages() {
           @add="openAdd"
           @settings="openSettings"
           @delete="deleteContactById"
+          @search-messages="openSearch"
         />
       </section>
       <section v-show="view === 'chat'" class="app-main app-mobile-screen">
@@ -489,19 +675,46 @@ async function listenForMessages() {
         <ChatInfoPanel mobile :conversation="activeConv" @close="closeInfo" @copy="copyText" @delete="deleteContact" @rename="renameContact" />
       </section>
       <section v-show="view === 'settings'" class="app-mobile-screen">
-        <Settings
-          mobile
-          @close="goToList"
-          @open-mailbox="openMailbox"
+         <Settings
+           mobile
+           @close="closeOverlay"
+           @open-mailbox="openMailbox"
+           @lock="lockVault"
+           @auto-lock-changed="onAutoLockChanged"
+           @diagnostics="exportDiagnostics"
         />
       </section>
       <section v-show="view === 'mailbox'" class="app-mobile-screen">
-        <MailboxSettings mobile @close="goToList" />
+        <MailboxSettings mobile @close="closeOverlay" />
       </section>
       <section v-show="view === 'add'" class="app-mobile-screen">
-        <MyId mobile @close="goToList" @added="onAdded" />
+        <MyId mobile @close="closeOverlay" @added="onAdded" />
       </section>
     </template>
+
+    <q-dialog v-model="searchDialog">
+      <q-card class="search-card" :dark="$q.dark.isActive">
+        <q-card-section><div class="text-h6">{{ t("contacts.searchMessages") }}</div></q-card-section>
+        <q-card-section class="q-gutter-sm">
+          <q-input v-model="messageQuery" dense outlined autofocus :placeholder="t('contacts.searchMessagesPlaceholder')" @keyup.enter="searchMessages" />
+          <div class="row q-gutter-sm">
+            <q-input v-model="searchFrom" type="date" dense outlined class="col" :label="t('contacts.fromDate')" />
+            <q-input v-model="searchTo" type="date" dense outlined class="col" :label="t('contacts.toDate')" />
+          </div>
+          <q-btn color="primary" :loading="searching" :label="t('contacts.search')" class="full-width" @click="searchMessages" />
+        </q-card-section>
+        <q-list separator v-if="searchResults.length">
+          <q-item v-for="([peerId, message], index) in searchResults" :key="`${peerId}-${message.id}-${index}`" clickable @click="selectSearchResult(peerId)">
+            <q-item-section>
+              <q-item-label>{{ conversations.find((item) => item.nodeId === peerId)?.name || peerId.slice(0, 12) }}</q-item-label>
+              <q-item-label caption>{{ new Date(message.time).toLocaleString() }}</q-item-label>
+              <q-item-label class="ellipsis">{{ message.text }}</q-item-label>
+            </q-item-section>
+          </q-item>
+        </q-list>
+        <q-card-section v-else-if="messageQuery && !searching" class="text-grey-6">{{ t("contacts.noSearchResults") }}</q-card-section>
+      </q-card>
+    </q-dialog>
   </div>
 </template>
 

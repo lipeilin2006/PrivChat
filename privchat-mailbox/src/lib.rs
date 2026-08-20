@@ -5,6 +5,6 @@
 //! 客户端）按原有路径 `privchat_mailbox::*` 引用。
 
 pub use privchat_common::{
-    find_pow, make_endpoint, send_request, verify_pow, ALPN, MAX_PAYLOAD, POW_DIFFICULTY,
-    MailboxRequest, MailboxResponse, Op, StoredMessage,
+    find_pow, make_endpoint, send_request, verify_pow, MailboxRequest, MailboxResponse, Op,
+    StoredMessage, ALPN, MAX_PAYLOAD, POW_DIFFICULTY,
 };

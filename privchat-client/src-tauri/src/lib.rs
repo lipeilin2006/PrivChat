@@ -2,10 +2,12 @@ mod layers;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use layers::app::App;
 use layers::transport::IncomingEnvelope;
 use layers::vault::Vault;
+use tauri::async_runtime::JoinHandle;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{mpsc, Mutex};
 
@@ -100,8 +102,14 @@ mod android_ctx {
             eprintln!("[privchat] ndk_context: new_global_ref failed");
             return false;
         };
+        // ndk_context stores this pointer without taking ownership. Keep the
+        // GlobalRef alive for the process lifetime; dropping it here leaves a
+        // stale JNI reference that crashes Hickory's Android DNS resolver.
+        let global = Box::new(global);
+        let global_ptr = global.as_raw().cast();
+        Box::leak(global);
         unsafe {
-            ndk_context::initialize_android_context(jvm_ptr, global.as_raw().cast());
+            ndk_context::initialize_android_context(jvm_ptr, global_ptr);
         }
         true
     }
@@ -112,6 +120,31 @@ mod android_ctx {
 struct VaultStatus {
     initialized: bool,
     unlocked: bool,
+    locked_until_secs: u64,
+}
+
+#[derive(serde::Serialize)]
+struct AppError {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(serde::Serialize)]
+struct Diagnostics {
+    app_version: &'static str,
+    protocol_version: u8,
+    vault_format: u64,
+    database_format: &'static str,
+    platform: &'static str,
+    mailbox_count: usize,
+    recent_errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct UnlockGuard {
+    failures: u32,
+    locked_until: Option<Instant>,
 }
 
 struct AppState {
@@ -119,6 +152,8 @@ struct AppState {
     data_dir: std::sync::Mutex<Option<PathBuf>>,
     app: Mutex<Option<Arc<App>>>,
     incoming: Mutex<Option<mpsc::UnboundedReceiver<IncomingEnvelope>>>,
+    incoming_task: Mutex<Option<JoinHandle<()>>>,
+    unlock_guard: std::sync::Mutex<UnlockGuard>,
 }
 
 impl AppState {
@@ -164,7 +199,7 @@ impl AppState {
             .expect("incoming receiver set");
         let handle = app_handle.clone();
         let app = app.clone();
-        tauri::async_runtime::spawn(async move {
+        let task = tauri::async_runtime::spawn(async move {
             while let Some(env) = rx.recv().await {
                 match app.handle_incoming(env).await {
                     Ok(Some(msg)) => {
@@ -175,15 +210,57 @@ impl AppState {
                 }
             }
         });
+        *self.incoming_task.lock().await = Some(task);
         Ok(())
     }
 }
 
 fn status(state: &AppState) -> VaultStatus {
+    let locked_until_secs = state
+        .unlock_guard
+        .lock()
+        .ok()
+        .and_then(|guard| guard.locked_until)
+        .map(|until| until.saturating_duration_since(Instant::now()).as_secs())
+        .unwrap_or(0);
     VaultStatus {
         initialized: Vault::is_initialized(&state.data_dir()),
         unlocked: state.require_app().is_ok(),
+        locked_until_secs,
     }
+}
+
+fn user_error(error: impl std::fmt::Display) -> String {
+    let text = error.to_string().to_lowercase();
+    let (code, message, retryable) = if text.contains("wrong password") {
+        ("wrong_password", "密码错误，请重试", true)
+    } else if text.contains("cannot open database") || text.contains("database") {
+        ("database_corrupt", "本地数据库损坏或无法解密", false)
+    } else if text.contains("incompatible") || text.contains("version") {
+        (
+            "incompatible_data",
+            "数据版本不兼容，请创建新的数据目录",
+            false,
+        )
+    } else if text.contains("connect") || text.contains("relay") || text.contains("network") {
+        ("network_unavailable", "网络不可用，请检查网络连接", true)
+    } else if text.contains("mailbox") {
+        ("mailbox_unavailable", "Mailbox 节点不可达", true)
+    } else if text.contains("identity") || text.contains("secret") {
+        (
+            "identity_recovery_failed",
+            "身份恢复失败，请检查本地数据",
+            false,
+        )
+    } else {
+        ("operation_failed", "操作失败，请稍后重试", true)
+    };
+    serde_json::to_string(&AppError {
+        code,
+        message: message.into(),
+        retryable,
+    })
+    .unwrap_or_else(|_| message.into())
 }
 
 #[tauri::command]
@@ -201,13 +278,15 @@ async fn create_vault(
         return Err("vault already initialized".into());
     }
     if password.is_empty() {
-        return Err("password must not be empty".into());
+        return Err("密码不能为空".into());
     }
-    let vault = Vault::create(&state.data_dir(), &password, layers::vault::DEFAULT_ITERATIONS)
-        .map_err(|e| e.to_string())?;
-    state
-        .start_with_key(app_handle, vault.db_key())
-        .await?;
+    let vault = Vault::create(
+        &state.data_dir(),
+        &password,
+        layers::vault::DEFAULT_ITERATIONS,
+    )
+    .map_err(user_error)?;
+    state.start_with_key(app_handle, vault.db_key()).await?;
     Ok(status(&state))
 }
 
@@ -217,14 +296,93 @@ async fn unlock_vault(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<VaultStatus, String> {
+    {
+        let guard = state
+            .unlock_guard
+            .lock()
+            .map_err(|_| "操作失败".to_string())?;
+        if let Some(until) = guard.locked_until {
+            if until > Instant::now() {
+                return Err(format!(
+                    "登录暂时锁定，请 {} 秒后重试",
+                    until.duration_since(Instant::now()).as_secs()
+                ));
+            }
+        }
+    }
     if !status(&state).initialized {
         return Err("vault not initialized".into());
     }
-    let vault = Vault::unlock(&state.data_dir(), &password).map_err(|e| e.to_string())?;
+    let vault = match Vault::unlock(&state.data_dir(), &password) {
+        Ok(vault) => {
+            if let Ok(mut guard) = state.unlock_guard.lock() {
+                guard.failures = 0;
+                guard.locked_until = None;
+            }
+            vault
+        }
+        Err(error) => {
+            if let Ok(mut guard) = state.unlock_guard.lock() {
+                guard.failures = guard.failures.saturating_add(1);
+                if guard.failures >= 5 {
+                    let seconds = 2u64.pow((guard.failures - 5).min(5));
+                    guard.locked_until = Some(Instant::now() + Duration::from_secs(seconds));
+                }
+            }
+            return Err(user_error(error));
+        }
+    };
     state
         .start_with_key(app_handle, vault.db_key())
-        .await?;
+        .await
+        .map_err(user_error)?;
     Ok(status(&state))
+}
+
+#[tauri::command]
+async fn lock_vault(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(app) = state.app.lock().await.take() {
+        app.shutdown().await;
+    }
+    if let Some(task) = state.incoming_task.lock().await.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    *state.incoming.lock().await = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn export_diagnostics(state: State<'_, AppState>) -> Result<Diagnostics, String> {
+    let app = state.require_app()?;
+    Ok(Diagnostics {
+        app_version: env!("CARGO_PKG_VERSION"),
+        protocol_version: 4,
+        vault_format: 2,
+        database_format: "sqlcipher-current",
+        platform: std::env::consts::OS,
+        mailbox_count: app.get_mailbox_peers().await.len(),
+        recent_errors: Vec::new(),
+    })
+}
+
+#[tauri::command]
+async fn change_vault_password(
+    old_password: String,
+    new_password: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if new_password.is_empty() {
+        return Err("新密码不能为空".into());
+    }
+    Vault::change_password_atomic(
+        &state.data_dir(),
+        &old_password,
+        &new_password,
+        layers::vault::DEFAULT_ITERATIONS,
+    )
+    .map_err(user_error)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -246,7 +404,9 @@ async fn connect_peer(
 }
 
 #[tauri::command]
-async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<layers::app::ContactSummary>, String> {
+async fn list_contacts(
+    state: State<'_, AppState>,
+) -> Result<Vec<layers::app::ContactSummary>, String> {
     Ok(state.require_app()?.list_contacts().await)
 }
 
@@ -256,6 +416,38 @@ async fn get_history(
     state: State<'_, AppState>,
 ) -> Result<Vec<layers::app::ChatMessage>, String> {
     Ok(state.require_app()?.get_history(&peer_id).await)
+}
+
+#[tauri::command]
+async fn get_draft(peer_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    state
+        .require_app()?
+        .load_draft(&peer_id)
+        .map_err(user_error)
+}
+
+#[tauri::command]
+async fn save_draft(
+    peer_id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .save_draft(&peer_id, &text)
+        .map_err(user_error)
+}
+
+#[tauri::command]
+async fn search_messages(
+    query: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<(String, layers::app::ChatMessage)>, String> {
+    state
+        .require_app()?
+        .search_messages(&query, limit.unwrap_or(100).min(500))
+        .map_err(user_error)
 }
 
 #[tauri::command]
@@ -299,6 +491,15 @@ async fn get_mailbox_peers(state: State<'_, AppState>) -> Result<Vec<String>, St
 }
 
 #[tauri::command]
+async fn ping_mailbox(peer_id: String, state: State<'_, AppState>) -> Result<u64, String> {
+    state
+        .require_app()?
+        .ping_mailbox(&peer_id)
+        .await
+        .map_err(user_error)
+}
+
+#[tauri::command]
 async fn add_mailbox_peer(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
     state
         .require_app()?
@@ -314,6 +515,41 @@ async fn remove_mailbox_peer(peer_id: String, state: State<'_, AppState>) -> Res
         .remove_mailbox_peer(&peer_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_mailbox_write_count(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.require_app()?.get_mailbox_write_count().await)
+}
+
+#[tauri::command]
+async fn get_auto_lock_minutes(state: State<'_, AppState>) -> Result<u64, String> {
+    state
+        .require_app()?
+        .get_auto_lock_minutes()
+        .map_err(user_error)
+}
+
+#[tauri::command]
+async fn set_auto_lock_minutes(minutes: u64, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .require_app()?
+        .set_auto_lock_minutes(minutes)
+        .map_err(user_error)
+}
+
+#[tauri::command]
+async fn set_mailbox_write_count(count: usize, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .require_app()?
+        .set_mailbox_write_count(count)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn exit_app(app_handle: tauri::AppHandle) {
+    app_handle.exit(0);
 }
 
 /// 解析落盘数据根目录（vault.json / privchat.db 实际存放位置）。
@@ -344,41 +580,14 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::erro
     Ok(base.join("data"))
 }
 
-/// 兼容旧版本：数据曾直接存放于基础目录（桌面=可执行文件所在目录，
-/// 安卓=包数据根目录），现在统一放到 `基础目录/data`。首次运行新版时，
-/// 若新位置没有 vault.json 而旧位置有，把数据文件复制过去，避免旧
-/// 保险箱无法解锁（复制而非移动，保留旧文件作备份）。
-fn migrate_legacy_data(new_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    if new_dir.join(layers::vault::VAULT_FILE).exists() {
-        return Ok(());
-    }
-    let Some(base) = new_dir.parent() else {
-        return Ok(());
-    };
-    if !base.join(layers::vault::VAULT_FILE).exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(new_dir)?;
-    for name in [
-        layers::vault::VAULT_FILE,
-        "privchat.db",
-        "privchat.db-shm",
-        "privchat.db-wal",
-    ] {
-        let src = base.join(name);
-        if src.exists() {
-            std::fs::copy(&src, new_dir.join(name))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 提前初始化 ndk_context，避免 iroh 在后台线程 panic（release 为 panic=abort）。
     #[cfg(target_os = "android")]
     android_ctx::init();
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_app::init());
     // barcode-scanner 仅在移动端（Android/iOS）提供真实实现；桌面端该 crate 为空。
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
@@ -387,10 +596,11 @@ pub fn run() {
             data_dir: std::sync::Mutex::new(None),
             app: Mutex::new(None),
             incoming: Mutex::new(None),
+            incoming_task: Mutex::new(None),
+            unlock_guard: std::sync::Mutex::new(UnlockGuard::default()),
         })
         .setup(|app| {
             let dir = resolve_data_dir(app.handle())?;
-            migrate_legacy_data(&dir)?;
             *app.state::<AppState>().data_dir.lock().unwrap() = Some(dir);
             Ok(())
         })
@@ -398,16 +608,28 @@ pub fn run() {
             vault_status,
             create_vault,
             unlock_vault,
+            lock_vault,
+            export_diagnostics,
+            change_vault_password,
             get_self_ticket,
             connect_peer,
             send_message,
             list_contacts,
             get_history,
+            get_draft,
+            save_draft,
+            search_messages,
             delete_contact,
             rename_contact,
             get_mailbox_peers,
+            ping_mailbox,
             add_mailbox_peer,
-            remove_mailbox_peer
+            remove_mailbox_peer,
+            get_mailbox_write_count,
+            get_auto_lock_minutes,
+            set_auto_lock_minutes,
+            set_mailbox_write_count,
+            exit_app
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
