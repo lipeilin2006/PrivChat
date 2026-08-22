@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onMounted, ref } from "vue";
+import { nextTick, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { Format, scan, cancel, requestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 import QRCode from "qrcode";
@@ -13,6 +13,7 @@ const emit = defineEmits(["close", "added"]);
 
 const props = defineProps({
   mobile: { type: Boolean, default: false },
+  active: { type: Boolean, default: true },
 });
 
 // —— 我的 ID / 邀请码 ——
@@ -148,10 +149,20 @@ async function submit() {
 }
 
 onMounted(loadMyId);
+watch(
+  () => props.active,
+  (active, wasActive) => {
+    if (active && !wasActive) loadMyId();
+  }
+);
 </script>
 
 <template>
   <div class="my-id" :class="{ 'is-scanning': scanning }">
+    <div v-if="loadingAdd" class="processing-overlay">
+      <q-spinner color="white" size="52px" />
+      <div class="processing-text">{{ t("id.processing") }}</div>
+    </div>
     <div class="myid-header">
       <q-btn flat round dense icon="arrow_back" color="grey-4" @click="emit('close')" />
        <span class="text-subtitle2">{{ t("id.title") }}</span>
@@ -272,6 +283,23 @@ onMounted(loadMyId);
   width: 100%;
   overflow: hidden;
   background: var(--app-bg);
+}
+
+.processing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+   background: var(--app-bg);
+}
+
+.processing-text {
+  color: #fff;
+  font-size: 15px;
 }
 
 .my-id.is-scanning {

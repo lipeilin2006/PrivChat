@@ -189,12 +189,13 @@ function resend(msg) {
                 <div class="bubble-meta">
                   <span>{{ fmtTime(g.msg.ts) }}</span>
                   <template v-if="g.msg.from === 'me'">
-                    <q-icon
-                      v-if="g.msg.status === 'sending'"
-                      name="schedule"
-                      size="14px"
-                      color="grey-5"
-                    />
+                     <q-icon
+                       v-if="['queued', 'sending', 'resending'].includes(g.msg.status)"
+                       :name="g.msg.status === 'queued' ? 'schedule' : 'sync'"
+                       size="14px"
+                       color="grey-5"
+                       :class="{ 'sending-icon': ['sending', 'resending'].includes(g.msg.status) }"
+                     />
                     <q-icon
                       v-else-if="g.msg.status === 'failed'"
                       name="error"
@@ -284,7 +285,8 @@ function resend(msg) {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: 100%;
+   height: 100%;
+   min-height: 0;
   background: var(--app-bg);
 }
 
@@ -297,6 +299,24 @@ function resend(msg) {
   background: var(--sidebar-bg);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
+}
+
+@media (max-width: 599px) {
+  .chat {
+    height: var(--visual-viewport-height, 100dvh);
+    max-height: var(--visual-viewport-height, 100dvh);
+    min-height: 0;
+  }
+
+  .chat-header {
+    position: relative;
+    z-index: 2;
+    flex: 0 0 auto;
+  }
+
+  .chat-scroll {
+    min-height: 0;
+  }
 }
 
 .mobile-back {
@@ -430,10 +450,20 @@ function resend(msg) {
   align-items: center;
   gap: 4px;
   font-size: 11px;
-  color: rgba(255, 255, 255, 0.6);
+   color: var(--bubble-meta);
   margin-top: 3px;
   float: right;
   margin-left: 10px;
+}
+
+.sending-icon {
+  animation: sending-icon-spin 1s linear infinite;
+}
+
+@keyframes sending-icon-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .composer {
@@ -454,6 +484,10 @@ function resend(msg) {
   border-radius: 24px;
   background: var(--input-bg);
   min-height: 44px;
+}
+
+.composer-input :deep(.q-field__native) {
+  max-height: 120px;
 }
 
 .send-btn {

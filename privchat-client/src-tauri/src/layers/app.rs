@@ -17,8 +17,9 @@
 //! 推导）。mailbox 队列按 `local_id` 分类 → 每队列单发送方，消息顺序即
 //! 发送方棘轮 `(gen, n)` 顺序。
 //!
-//! 持久化由 `store`（SQLCipher 全库加密）提供；TODO：FTP 大文件挂载。
+//! 持久化由 `store`（SQLCipher 全库加密）提供。
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -346,6 +347,14 @@ impl App {
         };
 
         let contacts = store.load_contacts()?;
+        let bound_ids: HashSet<String> = contacts
+            .values()
+            .map(|contact| contact.local_id.clone())
+            .collect();
+        let cutoff = now_ms().saturating_sub(super::store::UNBOUND_IDENTITY_TTL_MS);
+        for local_id in store.delete_expired_unbound_identities(&bound_ids, cutoff)? {
+            eprintln!("[app] removed expired unbound identity {local_id}");
+        }
         let contacts = Arc::new(Mutex::new(contacts));
         let history = Arc::new(Mutex::new(store.load_history()?));
 
@@ -443,6 +452,21 @@ impl App {
                 String::new()
             }
         }
+    }
+
+    pub async fn delete_pending_identity(&self, local_id: &str) -> Result<()> {
+        if self
+            .contacts
+            .lock()
+            .await
+            .values()
+            .any(|contact| contact.local_id == local_id)
+        {
+            return Err(anyhow!("identity is bound to a contact"));
+        }
+        self.pending.lock().await.retain(|id| id != local_id);
+        self.transport.drop_identity(local_id).await;
+        Ok(())
     }
 
     /// 当前配置的 mailbox 节点 peer_id 列表（空 = 未启用离线消息）。

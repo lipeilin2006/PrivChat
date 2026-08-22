@@ -20,6 +20,7 @@ const messages = {
       unlockHint: "所有本地数据均已加密。请输入密码解锁。",
       password: "密码",
       unlock: "解锁",
+      locking: "正在锁定，请稍候…",
     },
     common: {
       cancel: "取消",
@@ -144,6 +145,7 @@ const messages = {
       pasteTicket: "请粘贴连接凭证",
       added: "联系人已添加",
       connectFailed: "连接失败：{error}",
+      processing: "正在添加联系人，请稍候…",
       idCreated: "ID 创建失败：{error}",
       copied: "ID 已复制",
       copyFailed: "复制失败：{error}",
@@ -160,14 +162,14 @@ const messages = {
     },
   },
   en: {
-    vault: { createTitle: "Create your password", unlockTitle: "Enter password", createHint: "First launch: choose a password to encrypt all local data. It cannot be recovered if forgotten.", unlockHint: "All local data is encrypted. Enter your password to unlock.", password: "Password", unlock: "Unlock" },
+    vault: { createTitle: "Create your password", unlockTitle: "Enter password", createHint: "First launch: choose a password to encrypt all local data. It cannot be recovered if forgotten.", unlockHint: "All local data is encrypted. Enter your password to unlock.", password: "Password", unlock: "Unlock", locking: "Locking, please wait…" },
     common: { cancel: "Cancel", save: "Save", delete: "Delete", add: "Add", copy: "Copy", refresh: "Refresh", close: "Close", failed: "Failed", copied: "Copied" },
     contacts: { settings: "Settings", messages: "Messages", add: "Add contact", search: "Search contacts or messages", noMatches: "No matches", empty: "No conversations yet", open: "Open chat", delete: "Delete contact", deleteTitle: "Delete contact?", deleteMessage: 'Remove "{name}" and its chat history?', searchMessages: "Search messages", searchMessagesPlaceholder: "Enter message text", fromDate: "From", toDate: "To", noSearchResults: "No messages found" },
     chat: { message: "Message", resend: "resend", copied: "Message copied", copyFailed: "Copy failed: {error}", today: "Today", yesterday: "Yesterday", encrypted: "Encrypted · Peer to peer", resending: "Resending", cancelled: "Cancelled" },
     info: { title: "Chat info", cancel: "Cancel", save: "Save", rename: "Rename contact", online: "Online", offline: "Offline", nodeId: "Node ID", copy: "Copy", delete: "Delete contact", deleteTitle: "Delete contact?", deleteMessage: 'This removes "{name}" and clears the local chat history. Messages can\'t be recovered.', empty: "Select a conversation to see details" },
     settings: { title: "Settings", mailbox: "Mailbox", mailboxHint: "Manage offline message relays", theme: "Theme", themeHint: "Follow system or choose manually", language: "Language", languageHint: "Choose interface language", system: "System", dark: "Dark", light: "Light", chinese: "中文", english: "English", lock: "Lock now", lockHint: "Clear session data and return to the password screen", never: "Never", oneMinute: "1 minute", fiveMinutes: "5 minutes", autoLock: "Auto-lock", autoLockHint: "Lock the vault after inactivity", changePassword: "Change password", changePasswordHint: "Verify the old password and re-encrypt local data", oldPassword: "Old password", newPassword: "New password", confirmPassword: "Confirm new password", passwordWarning: "The password cannot be recovered. Store it safely.", passwordMismatch: "Password is empty or the new passwords do not match", passwordChanged: "Password changed", autoLockSaveFailed: "Failed to save auto-lock setting" },
     mailbox: { title: "Mailbox", tip: "Offline message relays. Messages are encrypted before upload. Choose how many copies are written for redundancy, then they are delivered when the recipient comes online.", copies: "Copies per message", all: "All configured", placeholder: "Paste a mailbox Node ID (64 hex chars)", noMailboxes: "No mailboxes configured.", nodeId: "Node ID must be 64 hex chars", loaded: "Failed to load mailbox list: {error}", countLoaded: "Failed to load write count: {error}", countSaved: "Write count saved", added: "Mailbox added", removed: "Mailbox removed", addFailed: "Add failed: {error}", removeFailed: "Remove failed: {error}", saveFailed: "Save failed: {error}" },
-    id: { title: "My ID", creating: "Creating your ID…", scanToAdd: "Scan to add me", copy: "Copy ID", refresh: "Refresh ID", hint: "Each refresh creates a new ID. Share it with one person to connect.", addTitle: "Add contact", displayName: "Display name", peerId: "Peer ID", peerPlaceholder: "Paste the peer's ID…", required: "Peer ID is required", scan: "Scan QR code", cameraPermission: "Camera permission required to scan a QR code", scanUnavailable: "Camera scan unavailable: {error}", pasteTicket: "Please paste a connection ticket", added: "Contact added", connectFailed: "Connect failed: {error}", idCreated: "Failed to create ID: {error}", copied: "ID copied", copyFailed: "Copy failed: {error}" },
+    id: { title: "My ID", creating: "Creating your ID…", scanToAdd: "Scan to add me", copy: "Copy ID", refresh: "Refresh ID", hint: "Each refresh creates a new ID. Share it with one person to connect.", addTitle: "Add contact", displayName: "Display name", peerId: "Peer ID", peerPlaceholder: "Paste the peer's ID…", required: "Peer ID is required", scan: "Scan QR code", cameraPermission: "Camera permission required to scan a QR code", scanUnavailable: "Camera scan unavailable: {error}", pasteTicket: "Please paste a connection ticket", added: "Contact added", connectFailed: "Connect failed: {error}", processing: "Adding contact, please wait…", idCreated: "Failed to create ID: {error}", copied: "ID copied", copyFailed: "Copy failed: {error}" },
     notify: { deleted: "Contact deleted", deleteFailed: "Delete failed: {error}", renamed: "Name updated", renameFailed: "Rename failed: {error}", sendFailed: "Send failed: {error}", operationFailed: "Operation failed. Please try again later." },
   },
 };

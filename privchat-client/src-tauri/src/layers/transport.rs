@@ -165,7 +165,7 @@ impl Transport {
     }
 
     /// 以「禁用 relay、仅直连」模式启动，用于单机/内网集成测试。
-    #[allow(dead_code)] // 仅在集成测试路径被引用
+    #[allow(dead_code)] // 仅由 App 的测试入口使用
     pub async fn start_no_relay(
         store: Arc<Store>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<IncomingEnvelope>)> {
@@ -238,8 +238,19 @@ impl Transport {
     pub async fn create_identity(&self) -> Result<String> {
         let secret = SecretKey::generate();
         let local_id = secret.public().to_string();
-        self.store.save_identity(&local_id, &secret.to_bytes())?;
         let id = build_identity(secret, self.use_relay, self.tx.clone()).await?;
+        if let Err(error) = self.store.save_identity(
+            &local_id,
+            &id.secret.to_bytes(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0),
+        ) {
+            let _ = id.router.shutdown().await;
+            id.endpoint.close().await;
+            return Err(error);
+        }
         self.identities
             .write()
             .await

@@ -38,10 +38,10 @@ async function confirmDelete() {
 
 const filtered = computed(() => {
   const q = search.value.trim().toLowerCase();
-  if (!q) return props.conversations;
-  return props.conversations.filter(
+  const conversations = q ? props.conversations.filter(
     (c) => c.name.toLowerCase().includes(q) || c.nodeId.toLowerCase().includes(q)
-  );
+  ) : props.conversations;
+  return [...conversations].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 });
 
 function fmtTime(ms) {

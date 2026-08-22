@@ -31,6 +31,8 @@ use super::app::{ChatMessage, Contact};
 /// 每条离线消息写入的 mailbox 节点数（0 = 全部已配置节点）。
 const MAILBOX_WRITE_COUNT_KEY: &str = "mailbox_write_count";
 const AUTO_LOCK_MINUTES_KEY: &str = "auto_lock_minutes";
+const IDENTITY_CREATED_PREFIX: &str = "identity_created:";
+pub const UNBOUND_IDENTITY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_MAILBOX_WRITE_COUNT: usize = 64;
 
 /// SQLite 持久化门面。连接用 `Mutex` 包裹以保证线程安全，且所有操作
@@ -197,11 +199,19 @@ impl Store {
     }
 
     /// 保存一个专属身份的私钥（SecretKey 字节）。整库已加密，直接存 BLOB。
-    pub fn save_identity(&self, local_id: &str, secret: &[u8]) -> Result<()> {
+    pub fn save_identity(&self, local_id: &str, secret: &[u8], created_at: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO identities (local_id, secret) VALUES (?1, ?2)",
             params![local_id, secret],
+        )?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![
+                format!("{IDENTITY_CREATED_PREFIX}{local_id}"),
+                created_at.to_string()
+            ],
         )?;
         Ok(())
     }
@@ -228,7 +238,45 @@ impl Store {
             "DELETE FROM identities WHERE local_id = ?1",
             params![local_id],
         )?;
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![format!("{IDENTITY_CREATED_PREFIX}{local_id}")],
+        )?;
         Ok(())
+    }
+
+    pub fn delete_expired_unbound_identities(
+        &self,
+        bound: &std::collections::HashSet<String>,
+        cutoff: u64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT local_id FROM identities")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut deleted = Vec::new();
+        for id in ids {
+            if bound.contains(&id) {
+                continue;
+            }
+            let key = format!("{IDENTITY_CREATED_PREFIX}{id}");
+            let created = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    params![key],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            if created != 0 && created <= cutoff {
+                conn.execute("DELETE FROM identities WHERE local_id = ?1", params![id])?;
+                conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+                deleted.push(id);
+            }
+        }
+        Ok(deleted)
     }
 
     /// 保存一个双棘轮会话状态（UPSERT）。`state` 为 `crypto::Ratchet::to_bytes`。
@@ -561,10 +609,10 @@ mod tests {
 
         let secret: [u8; 32] = [0x77; 32];
         store
-            .save_identity("local1", &secret)
+            .save_identity("local1", &secret, 1_000)
             .expect("save identity");
         store
-            .save_identity("local2", &[0x11; 32])
+            .save_identity("local2", &[0x11; 32], 2_000)
             .expect("save identity2");
 
         let loaded = store.load_identities().expect("load identities");

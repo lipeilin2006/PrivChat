@@ -1,11 +1,48 @@
 package com.keydown.privchat_client
 
 import android.os.Bundle
-import androidx.activity.enableEdgeToEdge
+import android.view.WindowManager
+import android.webkit.WebView
+import androidx.core.view.WindowCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
+@Suppress("DEPRECATION")
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
-    enableEdgeToEdge()
+    // Let Android resize the WebView when the IME opens instead of panning
+    // the whole activity above the keyboard.
+    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+    WindowCompat.setDecorFitsSystemWindows(window, true)
     super.onCreate(savedInstanceState)
+    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+  }
+
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+    super.onWindowFocusChanged(hasFocus)
+    if (hasFocus) {
+      window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+    }
+  }
+
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+      val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+      val imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+      val bottomInset = maxOf(imeBottom, systemBars.bottom)
+      val rootHeight = view.rootView.height
+      if (rootHeight > 0) {
+        val availableHeight = (rootHeight - systemBars.top - bottomInset).coerceAtLeast(1)
+        val params = view.layoutParams
+        if (params.height != availableHeight) {
+          params.height = availableHeight
+          view.layoutParams = params
+        }
+        view.translationY = systemBars.top.toFloat()
+      }
+      insets
+    }
+    ViewCompat.requestApplyInsets(webView)
   }
 }

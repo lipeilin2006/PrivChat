@@ -391,6 +391,18 @@ async fn get_self_ticket(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn delete_pending_identity(
+    local_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .require_app()?
+        .delete_pending_identity(&local_id)
+        .await
+        .map_err(user_error)
+}
+
+#[tauri::command]
 async fn connect_peer(
     ticket: String,
     name: Option<String>,
@@ -612,6 +624,7 @@ pub fn run() {
             export_diagnostics,
             change_vault_password,
             get_self_ticket,
+            delete_pending_identity,
             connect_peer,
             send_message,
             list_contacts,

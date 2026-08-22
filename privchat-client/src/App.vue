@@ -25,6 +25,7 @@ const vaultBusy = ref(false);
 const vaultPassword = ref("");
 const vaultError = ref("");
 const lockTimer = ref(null);
+const locking = ref(false);
 const vaultMode = computed(() =>
   vaultInitialized.value ? "unlock" : "create"
 );
@@ -245,9 +246,9 @@ async function renameContact(peerId, name) {
   }
 }
 
-async function doSend(msg, peerId) {
-  if (msg.status === "resending") return false;
-  msg.status = msg.retryCount ? "resending" : "sending";
+async function doSend(msg, peerId, retry = false) {
+  if (msg.status === "sending" || msg.status === "resending") return false;
+  msg.status = retry ? "resending" : "sending";
   try {
     const result = await invoke("send_message", { peerId, text: msg.text });
     msg.id = result.id;
@@ -278,7 +279,7 @@ function sendMessage(text) {
     from: "me",
     text,
     ts: Date.now(),
-    status: "sending",
+    status: "queued",
     retryCount: 0,
     error: "",
   });
@@ -299,11 +300,11 @@ function resendMessage(msg) {
     msgs.splice(idx, 1);
     msgs.push(msg);
   }
-  msg.status = "resending";
+  msg.status = "failed";
   activeConv.value.lastStatus = "sending";
   activeConv.value.lastMessage = msg.text;
   activeConv.value.timestamp = Date.now();
-  doSend(msg, activeConv.value.nodeId);
+  doSend(msg, activeConv.value.nodeId, true);
 }
 
 async function copyText(text) {
@@ -340,6 +341,8 @@ async function submitVault() {
 }
 
 async function lockVault() {
+  if (locking.value) return;
+  locking.value = true;
   try {
     Object.values(messagesByConv).flat().forEach((message) => {
       if (message.status === "sending" || message.status === "resending") {
@@ -369,6 +372,8 @@ async function lockVault() {
     view.value = "list";
   } catch (error) {
     vaultError.value = displayError(error);
+  } finally {
+    locking.value = false;
   }
 }
 
@@ -574,6 +579,7 @@ async function listenForMessages() {
         }}
       </p>
       <q-input
+        class="vault-password"
         v-model="vaultPassword"
         type="password"
         filled
@@ -597,6 +603,10 @@ async function listenForMessages() {
   </div>
 
   <div v-else class="app-root" :class="{ mobile: isMobile }">
+    <div v-if="locking" class="processing-overlay">
+      <q-spinner color="white" size="52px" />
+      <div class="processing-text">{{ t("vault.locking") }}</div>
+    </div>
     <!-- 桌面：Telegram 双栏 + 可选详情面板 -->
     <template v-if="!isMobile">
       <aside class="app-sidebar">
@@ -640,7 +650,7 @@ async function listenForMessages() {
              @auto-lock-changed="onAutoLockChanged"
              @diagnostics="exportDiagnostics"
           />
-          <MyId v-else-if="view === 'add'" @close="closeOverlay" @added="onAdded" />
+           <MyId v-else-if="view === 'add'" :active="true" @close="closeOverlay" @added="onAdded" />
           <MailboxSettings v-else @close="closeOverlay" />
         </div>
       </q-dialog>
@@ -688,7 +698,7 @@ async function listenForMessages() {
         <MailboxSettings mobile @close="closeOverlay" />
       </section>
       <section v-show="view === 'add'" class="app-mobile-screen">
-        <MyId mobile @close="closeOverlay" @added="onAdded" />
+          <MyId mobile :active="view === 'add'" @close="closeOverlay" @added="onAdded" />
       </section>
     </template>
 
@@ -725,6 +735,7 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
 body {
@@ -775,10 +786,19 @@ body.scanning-active .q-page {
   position: absolute;
   top: 0;
   right: 0;
-  bottom: env(safe-area-inset-bottom, 0px);
+   bottom: 0;
   left: 0;
   width: 100%;
   overflow: hidden;
+}
+
+@media (max-width: 599px) {
+  .app-root.mobile .app-sidebar,
+  .app-root.mobile .app-main,
+  .app-root.mobile .app-mobile-screen {
+    height: var(--visual-viewport-height, 100dvh);
+    max-height: var(--visual-viewport-height, 100dvh);
+  }
 }
 
 .app-root.mobile .app-main {
@@ -797,6 +817,7 @@ body.scanning-active .q-page {
   --text-secondary: #9e9e9e;
   --accent: #1976d2;
   --row-active: rgba(255, 255, 255, 0.08);
+  --bubble-meta: rgba(255, 255, 255, 0.62);
 }
 
 /* Quasar 默认浅色主题 */
@@ -811,6 +832,7 @@ body.scanning-active .q-page {
   --text-secondary: #757575;
   --accent: #1976d2;
   --row-active: rgba(0, 0, 0, 0.06);
+  --bubble-meta: rgba(33, 33, 33, 0.62);
 }
 
 .desktop-overlay {
@@ -884,5 +906,39 @@ body.scanning-active .q-page {
 
 .vault-submit {
   margin-top: 4px;
+}
+
+.vault-password .q-field__control {
+  min-height: 44px;
+  border-radius: 12px;
+  background: var(--input-bg);
+}
+
+.vault-password .q-field__native {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* The light theme needs darker icon buttons for sufficient contrast. */
+:root.light .q-btn.text-grey-4,
+:root.light .q-btn.text-grey-5 {
+  color: #455a64 !important;
+}
+
+.processing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: rgba(0, 0, 0, 0.68);
+}
+
+.processing-text {
+  color: #fff;
+  font-size: 15px;
 }
 </style>
